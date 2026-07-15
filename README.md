@@ -78,6 +78,7 @@ Save your whole current setup under a name, then load or switch between presets 
 | Min speed | 5 km/h | 0 - 60 | Won't trigger unless you were going at least this fast (blocks fire / slow-crush). |
 | Pass out when upside down | on | - | A second way to trigger: left on your roof long enough and the driver passes out - the screen blacks out, no crash needed. Holds until you flip back over or reset. Independent of "Enable blackout" - you can have pass-out blackouts with no crash blackout at all. |
 | &nbsp;&nbsp;Upside-down time | 13.5 s | 1 - 30 | How long inverted before you pass out (righting the car resets the timer). |
+| &nbsp;&nbsp;Upside-down angle | 120° | 90 - 170 | How far the car must tip to count as upside down. 90° = resting on its side, 170° = almost dead inverted. Lower = passes out more easily. |
 | &nbsp;&nbsp;Pass-out fade | 1.5 s | 0 - 5 | How gradually the screen fades to black as you pass out - a faint, not the crash's instant snap. |
 | &nbsp;&nbsp;Come-to fade | 1.2 s | 0 - 5 | How gradually your vision returns when you come to. |
 | &nbsp;&nbsp;Play death sound on pass-out | on | - | Play a sound when you pass out (crashes still use the main Death sound). Off = silent pass-outs. Needs a Death sound enabled. |

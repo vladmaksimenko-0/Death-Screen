@@ -47,6 +47,7 @@ local PASSOUT = {
     fadeOut   = im.FloatPtr(1.2),   -- seconds for vision to return when you come to (flipped back / reset)
     playSound = im.BoolPtr(true),   -- also play the custom death sound when you pass out (vs only on a crash)
     soundVol  = im.FloatPtr(1.0),   -- volume for the pass-out sound (its own knob, separate from the crash sound)
+    angle     = im.FloatPtr(120.0), -- degrees tipped from upright before you pass out (90=on side, 180=full roof); cos(120)=-0.5
 }
 local opacityPtr   = im.FloatPtr(1.0)     -- how black (1.0 = fully black)
 local scalePtr     = im.BoolPtr(false)    -- scale the blackout with how hard the crash was
@@ -260,6 +261,7 @@ local function buildSettings()
             flipFadeIn  = PASSOUT.fadeIn[0],
             flipFadeOut = PASSOUT.fadeOut[0],
             flipPlaySound = PASSOUT.playSound[0],
+            flipAngle   = PASSOUT.angle[0],
             opacity     = opacityPtr[0],
             scale       = scalePtr[0],
             scaleMin    = scaleMinPtr[0],
@@ -385,6 +387,7 @@ local function loadSettings(sIn)
         if s.flipFadeIn  ~= nil then PASSOUT.fadeIn[0]  = math.max(0.0, math.min(5.0, tonumber(s.flipFadeIn)  or 1.5)) end
         if s.flipFadeOut ~= nil then PASSOUT.fadeOut[0] = math.max(0.0, math.min(5.0, tonumber(s.flipFadeOut) or 1.2)) end
         if s.flipPlaySound ~= nil then PASSOUT.playSound[0] = (s.flipPlaySound == true) end
+        if s.flipAngle    ~= nil then PASSOUT.angle[0]     = math.max(90.0, math.min(170.0, tonumber(s.flipAngle) or 120.0)) end
         if s.opacity   ~= nil then opacityPtr[0]   = math.max(0.3, math.min(1.0,  tonumber(s.opacity)  or 1.0)) end
         if s.scale       ~= nil then scalePtr[0]        = (s.scale == true) end
         if s.scaleMin    ~= nil then scaleMinPtr[0]     = math.max(0.1, math.min(15.0, tonumber(s.scaleMin) or 1.5)) end
@@ -1689,6 +1692,8 @@ local function drawSettingsWindow()
             if PASSOUT.on[0] then
                 if slider("fliptime", "Upside-down time", PASSOUT.time, 1.0, 30.0, "%.1f s",
                     "How long you have to be upside down before you pass out. Righting the car resets the timer.") then dirty = true end
+                if slider("flipang", "Upside-down angle", PASSOUT.angle, 90.0, 170.0, "%.0f deg",
+                    "How far the car must tip before it counts as upside down. 90 = resting on its side, 170 = must be almost dead upside down. Default 120 = well onto the roof. Lower = passes out more easily.") then dirty = true end
                 if slider("flipfin", "Pass-out fade", PASSOUT.fadeIn, 0.0, 5.0, "%.1f s",
                     "How slowly the screen fades to black as you pass out. Unlike a crash (a sudden snap), this is a gradual faint. 0 = instant.") then dirty = true end
                 if slider("flipfout", "Come-to fade", PASSOUT.fadeOut, 0.0, 5.0, "%.1f s",
@@ -1842,10 +1847,10 @@ end
 -- "Pass out" trigger: if the car is left upside down (roof-down) long enough, the
 -- driver blacks out -- and unlike a crash blackout it HOLDS until you're flipped back
 -- over or you reset. The vehicle's up-vector points to world-up (z near 1) when upright
--- and flips to z near -1 on its roof. Pass out below -0.5 (clearly inverted; on its side
--- is ~0). Come to once it's rolled back past -0.2 (hysteresis so it doesn't flicker).
-local FLIP_THRESHOLD = -0.5   -- pass out below this
-local FLIP_RELEASE   = -0.2   -- come to once back above this
+-- and flips to z near -1 on its roof. The pass-out point is user-set as an ANGLE
+-- (PASSOUT.angle, degrees from upright): up.z below cos(angle) means "upside down".
+-- Come to once rolled back past that + a small hysteresis gap so it doesn't flicker.
+local FLIP_HYST = 0.3         -- up.z gap between passing out and coming to (anti-flicker)
 local flipTimer = 0
 local function readUpZ()
     local z
@@ -1876,10 +1881,11 @@ local function releasePassout()
 end
 
 local function updateFlipout(dt)
+    local thr = math.cos(PASSOUT.angle[0] * math.pi / 180)   -- up.z below this = "upside down"
     -- holding a passout blackout: release the instant we're flipped back (or lose the vehicle)
     if heldActive then
         local z = readUpZ()
-        if (not z) or z > FLIP_RELEASE then releasePassout() end
+        if (not z) or z > thr + FLIP_HYST then releasePassout() end
         return
     end
     if not (enabledPtr[0] and PASSOUT.on[0]) or isShowing or cooldownTimer > 0 then   -- passout is independent of 'Enable blackout'
@@ -1887,7 +1893,7 @@ local function updateFlipout(dt)
         return
     end
     local z = readUpZ()
-    if z and z < FLIP_THRESHOLD then
+    if z and z < thr then
         flipTimer = flipTimer + (dt or 0)
         if flipTimer >= PASSOUT.time[0] then
             flipTimer = 0
