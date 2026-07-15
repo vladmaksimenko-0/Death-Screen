@@ -28,6 +28,7 @@ local SETTINGS_PATH = "settings/DeathScreen/settings.json"
 local SOUND_DIR     = "/settings/DeathScreen/"   -- bare filenames resolve here
 local TEXT_CAP = 48
 local SUB_CAP  = 64
+local PRESET_CAP = 48
 
 -- imgui-backed setting pointers (these ARE the live settings)
 local enabledPtr   = im.BoolPtr(true)     -- GLOBAL master: off = nothing fires at all
@@ -37,6 +38,16 @@ local fadeInPtr    = im.FloatPtr(0.12)    -- seconds to snap to black
 local fadeOutPtr   = im.FloatPtr(0.9)     -- seconds to fade back in
 local thresholdPtr = im.FloatPtr(90000)   -- windowed crash damage needed to trigger ("hardcore" gate)
 local minSpeedPtr  = im.FloatPtr(5.0)     -- km/h floor (ignores fire/parked damage, slow crushes)
+-- Pass-out (upside-down) settings grouped in a table (keeps the file under LuaJIT's
+-- 200-locals-per-chunk cap; same reason as the SM slow-mo table).
+local PASSOUT = {
+    on        = im.BoolPtr(true),   -- "pass out" (blackout) after being upside down for a while
+    time      = im.FloatPtr(13.5),  -- seconds upside down before you pass out
+    fadeIn    = im.FloatPtr(1.5),   -- seconds to fade to black when passing out (gradual faint, NOT the crash snap)
+    fadeOut   = im.FloatPtr(1.2),   -- seconds for vision to return when you come to (flipped back / reset)
+    playSound = im.BoolPtr(true),   -- also play the custom death sound when you pass out (vs only on a crash)
+    soundVol  = im.FloatPtr(1.0),   -- volume for the pass-out sound (its own knob, separate from the crash sound)
+}
 local opacityPtr   = im.FloatPtr(1.0)     -- how black (1.0 = fully black)
 local scalePtr     = im.BoolPtr(false)    -- scale the blackout with how hard the crash was
 local scaleMinPtr  = im.FloatPtr(1.5)     -- shortest blackout (a crash that just barely triggers)
@@ -49,20 +60,41 @@ local soundBackFadePtr = im.FloatPtr(0.8) -- seconds to swell the game audio bac
 local showTextPtr  = im.BoolPtr(false)    -- draw a centered "WASTED"-style message once black
 local textBuf      = ffi.new("char[?]", TEXT_CAP)
 local subBuf       = ffi.new("char[?]", SUB_CAP)
+local presetNameBuf = ffi.new("char[?]", PRESET_CAP)  -- UI-only: the name box for saving a preset
 local textSizePtr  = im.FloatPtr(88)      -- title font size in px
 local textDelayPtr = im.FloatPtr(0.26)    -- seconds after full-black before the message slams in
 local colorArr     = im.ArrayFloat(3)     -- title color (RGB 0..1) for the imgui color picker
+-- extra text customization (message section)
+local subColorArr    = im.ArrayFloat(3)   -- subtitle color
+local subSizePtr     = im.FloatPtr(36)    -- subtitle font size (px)
+local textShadowPtr  = im.BoolPtr(true)   -- text shadow / glow behind the message
+local textShadowStrPtr = im.FloatPtr(0.05) -- shadow/glow spread (0..1)
+local textShadowColorArr = im.ArrayFloat(3) -- shadow/glow color
+local textPosPtr     = im.IntPtr(1)       -- vertical position: 0 top / 1 centre / 2 bottom
+local textBoldPtr    = im.BoolPtr(true)    -- bold vs normal weight
+local textItalicPtr  = im.BoolPtr(false)  -- italic
+local textSpacingPtr = im.FloatPtr(8)     -- letter spacing (px)
+local textFontPtr    = im.IntPtr(0)       -- index into FONTS
 
 -- extras
 local EVENT_CAP       = 96
-local slowmoPtr       = im.BoolPtr(false) -- bullet-time on crash
-local slowmoFactorPtr = im.FloatPtr(0.3)  -- time scale during slow-mo (1 = normal)
-local slowmoDurPtr    = im.FloatPtr(2.0)  -- real seconds the slow-mo lasts
+-- Slow-mo (bullet-time) settings grouped in one table: LuaJIT caps a function (incl.
+-- the file's main chunk) at 200 locals and we were bumping it -- a table is one local.
+local SM = {
+    on        = im.BoolPtr(false),  -- bullet-time on crash
+    factor    = im.FloatPtr(0.3),   -- time scale during slow-mo (1 = normal); the DEEP end when scaling
+    dur       = im.FloatPtr(2.0),   -- real seconds the slow-mo lasts; the FULL length when scaling
+    scale     = im.BoolPtr(false),  -- scale slow-mo length + depth with how hard the crash was
+    minDur    = im.FloatPtr(0.5),   -- shortest slow-mo (a crash that just barely triggers)
+    minFactor = im.FloatPtr(0.6),   -- mildest game speed (barely-triggering crash); deepens toward SM.factor
+    full      = im.FloatPtr(200000),-- crash force at/above which slow-mo is at full length + depth
+}
 local soundPtr        = im.BoolPtr(false) -- play a death sting on trigger
 local soundVolPtr     = im.FloatPtr(1.0)  -- sting volume
 local soundFadePtr    = im.BoolPtr(false) -- fade the sting out near its end instead of a hard cut
 local soundFadeDurPtr = im.FloatPtr(1.0)  -- fade-out length (seconds)
 local soundEventBuf   = ffi.new("char[?]", EVENT_CAP)
+PASSOUT.soundBuf      = ffi.new("char[?]", EVENT_CAP)   -- optional separate sound for a pass-out (blank = reuse the main death sound)
 local vignettePtr     = im.BoolPtr(false) -- tinted edge vignette instead of flat black
 local vignetteAfterPtr= im.BoolPtr(true)  -- true = vignette appears once the screen is black
 local vigFadeInPtr    = im.BoolPtr(true)  -- fade the vignette in (vs snap on)
@@ -72,7 +104,7 @@ local vigFadeOutDurPtr= im.FloatPtr(0.5)  -- vignette fade-out length (s)
 local tintArr         = im.ArrayFloat(3)  -- vignette edge color (RGB 0..1)
 
 -- Damage vignette: FPS-style. ANY crash (not just death-screen ones) flashes a
--- coloured vignette at the screen edges whose strength scales with the hit, then
+-- colored vignette at the screen edges whose strength scales with the hit, then
 -- fades away on its own. Independent of the blackout.
 local dmgVigPtr       = im.BoolPtr(true)
 local dmgVigMaxPtr    = im.FloatPtr(0.7)   -- peak opacity of the flash (0..1)
@@ -100,6 +132,32 @@ local recoveryBlurDurPtr = im.FloatPtr(1.5)   -- how long it takes to clear (s)
 local DEFAULT_COLOR   = {0.757, 0.071, 0.122}  -- #c1121f (GTA-ish red)
 local DEFAULT_TINT    = {0.45, 0.02, 0.02}     -- dark-red vignette edges
 local DEFAULT_DMGCOLOR= {0.75, 0.04, 0.04}     -- FPS damage red
+local DEFAULT_SUBCOLOR= {0.874, 0.890, 0.902}  -- #dfe3e6 light grey subtitle
+local DEFAULT_SHADOW  = {0.667, 0.0, 0.0}      -- #AA0000 dark-red glow (black is invisible on black)
+-- Message fonts (CSS font-family stacks). Index 0 = default; stored by index
+-- (textFontPtr) and applied to the overlay in the JS. The first group are fonts BeamNG
+-- itself bundles + registers via @font-face in its UI (our overlay lives in the same
+-- page, so these ALWAYS render) -- incl. "Digital" = the 7-segment display font
+-- (Segment7Standard.otf). The rest are common system fonts (depend on the OS having them).
+local FONTS = {
+    { name = "Default",          css = "'Segoe UI',Roboto,Arial,sans-serif" },
+    { name = "7-Segment",        css = "Digital,'Courier New',monospace" },
+    { name = "Squada One",       css = "'Squada One',Impact,sans-serif" },
+    { name = "Play",             css = "'Play','Segoe UI',sans-serif" },
+    { name = "Roboto Condensed", css = "'Roboto Condensed',Arial,sans-serif" },
+    { name = "News Cycle",       css = "'News Cycle',Arial,sans-serif" },
+    { name = "Overpass",         css = "'Overpass',Arial,sans-serif" },
+    { name = "Impact",           css = "Impact,'Arial Black',sans-serif" },
+    { name = "Arial Black",      css = "'Arial Black',Gadget,sans-serif" },
+    { name = "Arial",            css = "Arial,Helvetica,sans-serif" },
+    { name = "Verdana",          css = "Verdana,Geneva,sans-serif" },
+    { name = "Tahoma",           css = "Tahoma,Geneva,sans-serif" },
+    { name = "Trebuchet MS",     css = "'Trebuchet MS',Helvetica,sans-serif" },
+    { name = "Georgia",          css = "Georgia,'Times New Roman',serif" },
+    { name = "Times New Roman",  css = "'Times New Roman',Times,serif" },
+    { name = "Courier New",      css = "'Courier New',Courier,monospace" },
+    { name = "Comic Sans MS",    css = "'Comic Sans MS',cursive" },
+}
 
 local windowOpen   = im.BoolPtr(true)     -- the settings window (open on first load so it's found)
 local hideUIPtr    = im.BoolPtr(true)     -- hide this window while the death screen is showing
@@ -114,6 +172,7 @@ local function setBuf(buf, cap, s)
 end
 setBuf(textBuf, TEXT_CAP, "WASTED")
 setBuf(subBuf,  SUB_CAP,  "")
+setBuf(presetNameBuf, PRESET_CAP, "")
 colorArr[0] = im.Float(DEFAULT_COLOR[1])  -- default #c1121f (GTA-ish red)
 colorArr[1] = im.Float(DEFAULT_COLOR[2])
 colorArr[2] = im.Float(DEFAULT_COLOR[3])
@@ -124,10 +183,15 @@ tintArr[2] = im.Float(DEFAULT_TINT[3])
 dmgVigColorArr[0] = im.Float(DEFAULT_DMGCOLOR[1])
 dmgVigColorArr[1] = im.Float(DEFAULT_DMGCOLOR[2])
 dmgVigColorArr[2] = im.Float(DEFAULT_DMGCOLOR[3])
+for i = 0, 2 do subColorArr[i]        = im.Float(DEFAULT_SUBCOLOR[i + 1]) end
+for i = 0, 2 do textShadowColorArr[i] = im.Float(DEFAULT_SHADOW[i + 1]) end
 
 -- which collapsible sections are expanded, remembered across restarts. Keyed by
 -- the section label; `section()` fills in defaults on first run and flips
 -- sectionDirty when the user opens/closes one so we persist it.
+-- named presets: name -> a full settings snapshot (effect settings only). Persisted in
+-- settings.json under `presets`; the user can save/load/switch between them.
+local presets = {}
 local sectionOpen = {}
 local sectionDirty = false
 
@@ -166,9 +230,20 @@ local function saveSettings2(t)
     t.recoveryBlur    = recoveryBlurPtr[0]
     t.recoveryBlurAmt = recoveryBlurAmtPtr[0]
     t.recoveryBlurDur = recoveryBlurDurPtr[0]
+    t.subColor      = { tonumber(subColorArr[0]), tonumber(subColorArr[1]), tonumber(subColorArr[2]) }
+    t.subSize       = subSizePtr[0]
+    t.textShadow    = textShadowPtr[0]
+    t.textShadowStr = textShadowStrPtr[0]
+    t.textShadowColor = { tonumber(textShadowColorArr[0]), tonumber(textShadowColorArr[1]), tonumber(textShadowColorArr[2]) }
+    t.textPos       = textPosPtr[0]
+    t.textBold      = textBoldPtr[0]
+    t.textItalic    = textItalicPtr[0]
+    t.textSpacing   = textSpacingPtr[0]
+    t.textFont      = textFontPtr[0]
     t.windowOpen    = windowOpen[0]
     t.hideUI        = hideUIPtr[0]
     t.noticeSeen    = noticeSeen
+    t.presets       = presets
 end
 
 local function buildSettings()
@@ -180,6 +255,11 @@ local function buildSettings()
             fadeOut     = fadeOutPtr[0],
             threshold   = thresholdPtr[0],
             minSpeed    = minSpeedPtr[0],
+            flip        = PASSOUT.on[0],
+            flipTime    = PASSOUT.time[0],
+            flipFadeIn  = PASSOUT.fadeIn[0],
+            flipFadeOut = PASSOUT.fadeOut[0],
+            flipPlaySound = PASSOUT.playSound[0],
             opacity     = opacityPtr[0],
             scale       = scalePtr[0],
             scaleMin    = scaleMinPtr[0],
@@ -195,14 +275,20 @@ local function buildSettings()
             textSize    = textSizePtr[0],
             textDelay   = textDelayPtr[0],
             color       = { tonumber(colorArr[0]), tonumber(colorArr[1]), tonumber(colorArr[2]) },
-            slowmo      = slowmoPtr[0],
-            slowmoFactor= slowmoFactorPtr[0],
-            slowmoDur   = slowmoDurPtr[0],
+            slowmo      = SM.on[0],
+            slowmoFactor= SM.factor[0],
+            slowmoDur   = SM.dur[0],
+            slowScale   = SM.scale[0],
+            slowMinDur  = SM.minDur[0],
+            slowMinFactor = SM.minFactor[0],
+            slowFull    = SM.full[0],
             sound       = soundPtr[0],
             soundVol    = soundVolPtr[0],
             soundFade   = soundFadePtr[0],
             soundFadeDur= soundFadeDurPtr[0],
             soundEvent  = ffi.string(soundEventBuf),
+            flipSound   = ffi.string(PASSOUT.soundBuf),
+            flipSoundVol = PASSOUT.soundVol[0],
             sections    = sectionOpen,   -- which collapsible headers are expanded
     }
     saveSettings2(t)   -- vignette / damage-vignette / blur / window (split for the upvalue cap)
@@ -222,6 +308,7 @@ pcall(function() DEFAULT_SETTINGS = buildSettings() end)
 DEFAULT_SETTINGS.windowOpen = nil
 DEFAULT_SETTINGS.sections   = nil
 DEFAULT_SETTINGS.noticeSeen = nil
+DEFAULT_SETTINGS.presets    = nil    -- Reset-to-defaults must not wipe saved presets
 
 -- second half of the loader, split out purely to keep each function's upvalue
 -- count under Lua's hard cap of 60 (every setting pointer it touches is an upvalue).
@@ -261,9 +348,24 @@ local function loadSettings2(s)
     if s.recoveryBlur    ~= nil then recoveryBlurPtr[0]    = (s.recoveryBlur == true) end
     if s.recoveryBlurAmt ~= nil then recoveryBlurAmtPtr[0] = math.max(0.05, math.min(1.0, tonumber(s.recoveryBlurAmt) or 0.8)) end
     if s.recoveryBlurDur ~= nil then recoveryBlurDurPtr[0] = math.max(0.1, math.min(8.0, tonumber(s.recoveryBlurDur) or 1.5)) end
+    if type(s.subColor) == "table" and #s.subColor >= 3 then
+        for i = 0, 2 do subColorArr[i] = im.Float(math.max(0.0, math.min(1.0, tonumber(s.subColor[i + 1]) or 0))) end
+    end
+    if s.subSize    ~= nil then subSizePtr[0]    = math.max(10.0, math.min(200.0, tonumber(s.subSize) or 36)) end
+    if s.textShadow ~= nil then textShadowPtr[0] = (s.textShadow == true) end
+    if s.textShadowStr ~= nil then textShadowStrPtr[0] = math.max(0.0, math.min(1.0, tonumber(s.textShadowStr) or 0.05)) end
+    if type(s.textShadowColor) == "table" and #s.textShadowColor >= 3 then
+        for i = 0, 2 do textShadowColorArr[i] = im.Float(math.max(0.0, math.min(1.0, tonumber(s.textShadowColor[i + 1]) or 0))) end
+    end
+    if s.textPos    ~= nil then textPosPtr[0]    = math.max(0, math.min(2, math.floor(tonumber(s.textPos) or 1))) end
+    if s.textBold   ~= nil then textBoldPtr[0]   = (s.textBold == true) end
+    if s.textItalic ~= nil then textItalicPtr[0] = (s.textItalic == true) end
+    if s.textSpacing ~= nil then textSpacingPtr[0] = math.max(0.0, math.min(40.0, tonumber(s.textSpacing) or 8)) end
+    if s.textFont   ~= nil then textFontPtr[0]   = math.max(0, math.min(#FONTS - 1, math.floor(tonumber(s.textFont) or 0))) end
     if s.windowOpen ~= nil then windowOpen[0]  = (s.windowOpen == true) end
     if s.hideUI     ~= nil then hideUIPtr[0]   = (s.hideUI == true) end
     if s.noticeSeen ~= nil then noticeSeen     = (s.noticeSeen == true) end
+    if type(s.presets) == "table" then presets = s.presets end
 end
 
 -- Loads settings from `sIn` if given (used by Reset-to-defaults), else from disk.
@@ -276,8 +378,13 @@ local function loadSettings(sIn)
         if s.duration  ~= nil then durationPtr[0]  = math.max(0.5, math.min(15.0, tonumber(s.duration) or 4.0)) end
         if s.fadeIn    ~= nil then fadeInPtr[0]    = math.max(0.0, math.min(3.0,  tonumber(s.fadeIn)  or 0.12)) end
         if s.fadeOut   ~= nil then fadeOutPtr[0]   = math.max(0.0, math.min(5.0,  tonumber(s.fadeOut) or 0.9)) end
-        if s.threshold ~= nil then thresholdPtr[0] = math.max(500.0, math.min(300000.0, tonumber(s.threshold) or 90000)) end
+        if s.threshold ~= nil then thresholdPtr[0] = math.max(500.0, math.min(500000.0, tonumber(s.threshold) or 90000)) end
         if s.minSpeed  ~= nil then minSpeedPtr[0]  = math.max(0.0, math.min(150.0, tonumber(s.minSpeed) or 5.0)) end
+        if s.flip      ~= nil then PASSOUT.on[0]      = (s.flip == true) end
+        if s.flipTime  ~= nil then PASSOUT.time[0]  = math.max(1.0, math.min(30.0, tonumber(s.flipTime) or 13.5)) end
+        if s.flipFadeIn  ~= nil then PASSOUT.fadeIn[0]  = math.max(0.0, math.min(5.0, tonumber(s.flipFadeIn)  or 1.5)) end
+        if s.flipFadeOut ~= nil then PASSOUT.fadeOut[0] = math.max(0.0, math.min(5.0, tonumber(s.flipFadeOut) or 1.2)) end
+        if s.flipPlaySound ~= nil then PASSOUT.playSound[0] = (s.flipPlaySound == true) end
         if s.opacity   ~= nil then opacityPtr[0]   = math.max(0.3, math.min(1.0,  tonumber(s.opacity)  or 1.0)) end
         if s.scale       ~= nil then scalePtr[0]        = (s.scale == true) end
         if s.scaleMin    ~= nil then scaleMinPtr[0]     = math.max(0.1, math.min(15.0, tonumber(s.scaleMin) or 1.5)) end
@@ -298,14 +405,20 @@ local function loadSettings(sIn)
                 colorArr[i] = im.Float(math.max(0.0, math.min(1.0, v)))
             end
         end
-        if s.slowmo       ~= nil then slowmoPtr[0]       = (s.slowmo == true) end
-        if s.slowmoFactor ~= nil then slowmoFactorPtr[0] = math.max(0.05, math.min(1.0, tonumber(s.slowmoFactor) or 0.3)) end
-        if s.slowmoDur    ~= nil then slowmoDurPtr[0]    = math.max(0.0, math.min(10.0, tonumber(s.slowmoDur) or 2.0)) end
+        if s.slowmo       ~= nil then SM.on[0]        = (s.slowmo == true) end
+        if s.slowmoFactor ~= nil then SM.factor[0]    = math.max(0.05, math.min(1.0, tonumber(s.slowmoFactor) or 0.3)) end
+        if s.slowmoDur    ~= nil then SM.dur[0]       = math.max(0.0, math.min(10.0, tonumber(s.slowmoDur) or 2.0)) end
+        if s.slowScale    ~= nil then SM.scale[0]     = (s.slowScale == true) end
+        if s.slowMinDur   ~= nil then SM.minDur[0]    = math.max(0.0, math.min(10.0, tonumber(s.slowMinDur) or 0.5)) end
+        if s.slowMinFactor~= nil then SM.minFactor[0] = math.max(0.05, math.min(1.0, tonumber(s.slowMinFactor) or 0.6)) end
+        if s.slowFull     ~= nil then SM.full[0]      = math.max(1000.0, math.min(500000.0, tonumber(s.slowFull) or 200000)) end
         if s.sound        ~= nil then soundPtr[0]        = (s.sound == true) end
         if s.soundVol     ~= nil then soundVolPtr[0]     = math.max(0.0, math.min(3.0, tonumber(s.soundVol) or 1.0)) end
         if s.soundFade    ~= nil then soundFadePtr[0]    = (s.soundFade == true) end
         if s.soundFadeDur ~= nil then soundFadeDurPtr[0] = math.max(0.1, math.min(10.0, tonumber(s.soundFadeDur) or 1.0)) end
         if s.soundEvent   ~= nil then setBuf(soundEventBuf, EVENT_CAP, s.soundEvent) end
+        if s.flipSound    ~= nil then setBuf(PASSOUT.soundBuf, EVENT_CAP, s.flipSound) end
+        if s.flipSoundVol ~= nil then PASSOUT.soundVol[0] = math.max(0.0, math.min(3.0, tonumber(s.flipSoundVol) or 1.0)) end
         if type(s.sections) == "table" then
             for k, v in pairs(s.sections) do
                 if type(k) == "string" then sectionOpen[k] = (v == true) end
@@ -322,6 +435,28 @@ local function resetAllDefaults()
     saveSettings()
 end
 
+-- Presets: snapshot the current EFFECT settings (no window/section/notice/presets keys)
+-- under a name, then load/switch between them.
+local function capturePreset()
+    local t = buildSettings()
+    t.presets = nil; t.windowOpen = nil; t.sections = nil; t.noticeSeen = nil
+    return t
+end
+local function savePreset(name)
+    if not name or name == "" then return end
+    presets[name] = capturePreset()
+    saveSettings()
+end
+local function loadPreset(name)
+    local p = presets[name]
+    if type(p) ~= "table" then return end
+    loadSettings(p)     -- applies the preset's effect settings; leaves presets/window/etc. alone
+    saveSettings()
+end
+local function deletePreset(name)
+    if presets[name] ~= nil then presets[name] = nil; saveSettings() end
+end
+
 --------------------------------------------------------------------------------
 -- BLACKOUT + TOAST OVERLAY  (injected once, then driven by JS calls)
 --------------------------------------------------------------------------------
@@ -331,7 +466,7 @@ local OVERLAY_JS = [==[
 (function(){
   if(window.__DeathScreen) return;
   var ds = window.__DeathScreen = {};
-  var overlay=null, vig=null, txt=null, sub=null, dmgVig=null, timers=[], toastEl=null, toastT=null;
+  var overlay=null, vig=null, txt=null, sub=null, dmgVig=null, timers=[], toastEl=null, toastT=null, warmEl=null;
   function clearTimers(){ for(var i=0;i<timers.length;i++){clearTimeout(timers[i]);} timers=[]; }
   function hexRgba(h,a){ h=(''+h).replace('#',''); if(h.length===3){h=h[0]+h[0]+h[1]+h[1]+h[2]+h[2];} var n=parseInt(h,16)||0; return 'rgba('+((n>>16)&255)+','+((n>>8)&255)+','+(n&255)+','+a+')'; }
   function ensure(){
@@ -361,6 +496,23 @@ local OVERLAY_JS = [==[
       +'opacity:0;transition:opacity .45s ease;text-align:center;position:relative;';
     overlay.appendChild(vig); overlay.appendChild(txt); overlay.appendChild(sub);
     document.body.appendChild(overlay);
+    /* Force every custom message font to fully LOAD AND LAY OUT by rendering hidden
+       sample text in each one, kept permanently offscreen. This is more reliable than
+       document.fonts.load (whose promise can resolve before the font is usable for
+       layout), so the visible message never renders in a fallback and then swaps/resizes. */
+    try{
+      if(!warmEl){
+        warmEl=document.createElement('div'); warmEl.id='dsWarm';
+        warmEl.style.cssText='position:fixed;left:-99999px;top:0;opacity:0;pointer-events:none;white-space:nowrap;';
+        ['Digital','Squada One','Play','Roboto Condensed','News Cycle','Overpass','Impact','Arial Black'].forEach(function(f){
+          var s=document.createElement('span');
+          s.style.cssText="font-family:'"+f+"';font-size:120px;font-weight:800;font-style:italic;";
+          s.textContent='WASTEDwasted 0123';
+          warmEl.appendChild(s);
+        });
+        document.body.appendChild(warmEl);
+      }
+    }catch(e){}
   }
   ds.show=function(o){
     o=o||{}; ensure(); clearTimers();
@@ -377,12 +529,27 @@ local OVERLAY_JS = [==[
       vig.style.transition='none'; vig.style.opacity='0'; vig.style.background='';
     }
     /* prime the message hidden + slightly enlarged; revealed AFTER the screen is black */
-    txt.textContent=o.text||''; txt.style.color=o.textColor||'#c1121f';
+    txt.textContent=o.text||''; sub.textContent=o.sub||'';
+    txt.style.color=o.textColor||'#c1121f';
     if(o.textSize){ txt.style.fontSize=o.textSize+'px'; }
-    sub.textContent=o.sub||'';
+    if(o.font){ overlay.style.fontFamily=o.font; }   /* txt + sub inherit it (fonts are pre-warmed on level load) */
+    sub.style.color=o.subColor||'#dfe3e6';
+    if(o.subSize){ sub.style.fontSize=o.subSize+'px'; }
+    /* font: title carries the weight + letter spacing, both share italic */
+    var w=(o.bold===false)?'400':'800', st=o.italic?'italic':'normal';
+    txt.style.fontWeight=w; txt.style.fontStyle=st;
+    txt.style.letterSpacing=(o.spacing==null?8:o.spacing)+'px'; sub.style.fontStyle=st;
+    /* shadow / glow (symmetric halo, doubles as a readability shadow) */
+    var sh='none';
+    if(o.shadow){ var sc=hexRgba(o.shadowColor||'#000000',0.92), b=Math.round(6+(o.shadowStr==null?0.6:o.shadowStr)*46); sh='0 0 '+b+'px '+sc+', 0 0 '+Math.round(b*0.5)+'px '+sc; }
+    txt.style.textShadow=sh; sub.style.textShadow=sh;
+    /* vertical position: 0 top, 1 centre, 2 bottom */
+    var p=(o.pos==null?1:o.pos);
+    overlay.style.justifyContent=(p===0?'flex-start':(p===2?'flex-end':'center'));
+    overlay.style.paddingTop=(p===0?'12vh':'0'); overlay.style.paddingBottom=(p===2?'12vh':'0');
     txt.style.transition='none'; sub.style.transition='none';
     txt.style.opacity='0'; sub.style.opacity='0';
-    txt.style.transform='scale(1.18)'; sub.style.transform='translateY(8px)';
+    txt.style.transform='none'; sub.style.transform='none';   /* no scale/slide = no resize/move; clean fade only */
     void overlay.offsetWidth;              /* force reflow so the fade-in + resets apply */
     overlay.style.opacity='1';
     if(o.vignette){
@@ -395,22 +562,35 @@ local OVERLAY_JS = [==[
          visible window (i.e. the blackout length). 0 = snap off at the end. */
       var visStart=vdelay+(o.vigFadeInMs||0), visEnd=fadeIn+hold;
       var vfoutMs=Math.min((o.vigFadeOutMs==null?0:o.vigFadeOutMs), Math.max(0, visEnd-visStart));
-      timers.push(setTimeout(function(){ vig.style.transition='opacity '+(vfoutMs/1000)+'s ease'; vig.style.opacity='0'; }, visEnd-vfoutMs));
+      /* a held passout keeps the vignette up until ds.release(); only auto-fade it for a timed blackout */
+      if(!o.hold){ timers.push(setTimeout(function(){ vig.style.transition='opacity '+(vfoutMs/1000)+'s ease'; vig.style.opacity='0'; }, visEnd-vfoutMs)); }
     }
     if(o.text||o.sub){
       var delay=fadeIn+(o.textDelayMs==null?260:o.textDelayMs);  /* GTA-style beat after black */
       timers.push(setTimeout(function(){
-        txt.style.transition='opacity .45s ease, transform .6s cubic-bezier(.16,.9,.24,1)';
-        sub.style.transition='opacity .5s ease .12s, transform .5s ease .12s';
-        if(o.text){ txt.style.opacity='1'; txt.style.transform='scale(1)'; }
-        if(o.sub){ sub.style.opacity='.9'; sub.style.transform='translateY(0)'; }
+        txt.style.transition='opacity .45s ease';   /* opacity only -- text stays at its final size/position */
+        sub.style.transition='opacity .5s ease .12s';
+        if(o.text){ txt.style.opacity='1'; }
+        if(o.sub){ sub.style.opacity='.9'; }
       }, delay));
     }
-    timers.push(setTimeout(function(){
-      overlay.style.transition='opacity '+(fadeOut/1000)+'s ease';
-      overlay.style.opacity='0';   /* vignette already handled its own fade-out above */
-      txt.style.opacity='0'; sub.style.opacity='0';
-    }, fadeIn+hold));
+    /* o.hold = keep the black up indefinitely (passed-out upside down); ds.release()
+       ends it. Otherwise schedule the normal auto fade-out. */
+    if(!o.hold){
+      timers.push(setTimeout(function(){
+        overlay.style.transition='opacity '+(fadeOut/1000)+'s ease';
+        overlay.style.opacity='0';   /* vignette already handled its own fade-out above */
+        txt.style.opacity='0'; sub.style.opacity='0';
+      }, fadeIn+hold));
+    }
+  };
+  /* release a held blackout: fade everything back out over fadeOutMs */
+  ds.release=function(fadeOutMs){
+    clearTimers();
+    var fo=(fadeOutMs==null?900:fadeOutMs)/1000;
+    if(overlay){ overlay.style.transition='opacity '+fo+'s ease'; overlay.style.opacity='0'; }
+    if(vig){ vig.style.transition='opacity '+fo+'s ease'; vig.style.opacity='0'; }
+    if(txt)txt.style.opacity='0'; if(sub)sub.style.opacity='0';
   };
   ds.hide=function(){ clearTimers(); if(overlay){ overlay.style.opacity='0';
     if(vig)vig.style.opacity='0'; if(txt)txt.style.opacity='0'; if(sub)sub.style.opacity='0'; } };
@@ -486,8 +666,8 @@ local OVERLAY_JS = [==[
     clearTimers();
     if(D.raf){ cancelAnimationFrame(D.raf); D.raf=0; }
     if(toastT){ clearTimeout(toastT); toastT=0; }
-    [overlay,dmgVig,toastEl].forEach(function(el){ if(el&&el.parentNode){ el.parentNode.removeChild(el); } });
-    overlay=vig=txt=sub=dmgVig=toastEl=null;
+    [overlay,dmgVig,toastEl,warmEl].forEach(function(el){ if(el&&el.parentNode){ el.parentNode.removeChild(el); } });
+    overlay=vig=txt=sub=dmgVig=toastEl=warmEl=null;
     try{ delete window.__DeathScreen; }catch(e){ window.__DeathScreen=null; }
   };
 })();
@@ -532,6 +712,7 @@ end
 -- TRIGGERING
 --------------------------------------------------------------------------------
 local isShowing   = false
+local heldActive  = false -- a passout blackout that HOLDS until righted/reset (no auto-fade)
 local activeTimer = 0     -- real-time seconds left before we allow another trigger
 local lastReason  = ""    -- for the debug line in the settings window
 local uiHiddenByTrigger = false  -- did WE auto-close the window for this blackout?
@@ -552,13 +733,17 @@ local dmgAccum = 0         -- damage gathered since the last hit was fed to the 
 local dmgVigThrottle = 0   -- rate-limit for feeding hits to the browser animation
 local dmgVigWasOn = false  -- so we clear the effect once when it's turned off
 
--- Sound cutoff: mute the gameplay audio channels during the blackout and
--- restore the player's volumes after. We mute every GAME channel -- including
--- 'Other', where misc vehicle sounds like the post-crash hazard-blinker tick
--- route (that was leaking through before) -- but deliberately DO NOT touch
--- 'Gui'/'Ui', because our death sting ('AudioGui' playOnce) routes there; that
--- lets the sting be heard over the silence. ('Master' is the parent -- muting it
--- would kill the sting too, so we mute the children individually instead.)
+-- Sound cutoff: mute the gameplay audio channels during the blackout and restore
+-- the player's volumes after. We mute every GAME channel but deliberately DO NOT
+-- touch 'Gui'/'Ui' or 'Master' (the parent) -- our death sound is an 'AudioGui'
+-- playOnce, and muting Master would kill it too, so we mute the children.
+--
+-- 'Other' is special: a loose custom audio FILE (the "use your own .ogg" path)
+-- STREAMS through AudioChannelOther, so muting Other silences the player's own
+-- death sound -- the exact "custom sounds get cut" bug. The game's own comics.lua
+-- keeps Gui + Master + Other unmuted for the same reason. So we mute Other only
+-- when NO loose custom file is playing (kills the post-crash hazard-blinker tick
+-- etc.), and skip it when a custom file IS the death sound so it can be heard.
 local MUTE_CHANNELS = {
     "AudioChannelPower", "AudioChannelForcedInduction", "AudioChannelTransmission",
     "AudioChannelSuspension", "AudioChannelSurface", "AudioChannelCollision",
@@ -567,13 +752,21 @@ local MUTE_CHANNELS = {
 }
 local soundCutActive = false
 local savedVolumes = {}
-local function muteGame()
+local function muteGame(soundEv)
     if soundCutActive then return end
     pcall(function()
         if Engine and Engine.Audio then
+            savedVolumes = {}
+            -- keep AudioChannelOther alive when the sound about to play is a loose custom
+            -- FILE (not an "event:" FMOD event), since those stream through Other. The
+            -- caller passes the exact sound (main death sound, or the pass-out one).
+            local ev = soundEv or (soundPtr[0] and ffi.string(soundEventBuf) or "")
+            local keepOther = ev ~= "" and ev:sub(1, 6) ~= "event:"
             for _, ch in ipairs(MUTE_CHANNELS) do
-                savedVolumes[ch] = Engine.Audio.getChannelVolume(ch, false)
-                Engine.Audio.setChannelVolume(ch, 0.0)
+                if not (keepOther and ch == "AudioChannelOther") then
+                    savedVolumes[ch] = Engine.Audio.getChannelVolume(ch, false)
+                    Engine.Audio.setChannelVolume(ch, 0.0)
+                end
             end
             soundCutActive = true
         end
@@ -618,6 +811,36 @@ local function restoreSpeed()
     if not slowmoActive then return end
     slowmoActive = false
     setSimSpeed(1)
+end
+-- Slow-mo game-speed + duration, optionally scaled by crash force ("Scale with crash
+-- force" under slow-mo): at the trigger threshold -> "Min slow-mo length" + "Mildest
+-- game speed"; at "Full-blast force" (and above) -> the full "Slow-mo length" + "Game
+-- speed". No crashForce (a manual test) or scaling off -> the full set values.
+local function slowmoParams(crashForce)
+    local factor = SM.factor[0]
+    local dur    = SM.dur[0]
+    if SM.scale[0] and crashForce then
+        local thr  = thresholdPtr[0]
+        local full = math.max(thr + 1, SM.full[0])
+        local t = (crashForce - thr) / (full - thr)
+        if t < 0 then t = 0 elseif t > 1 then t = 1 end
+        local minDur = math.min(SM.minDur[0], SM.dur[0])
+        dur = minDur + (SM.dur[0] - minDur) * t
+        -- game speed is inverted (lower = deeper): the "mild" end is the HIGHER value,
+        -- deepening toward the set "Game speed" as the crash gets harder.
+        local mild = math.max(SM.minFactor[0], SM.factor[0])
+        factor = mild + (SM.factor[0] - mild) * t
+    end
+    return factor, dur
+end
+-- Kick off bullet-time. Shared by the full death screen AND the blackout-off
+-- "slow-mo only" path, so slow-mo no longer depends on the black screen.
+local function triggerSlowmo(crashForce)
+    if slowmoActive then return end
+    local factor, dur = slowmoParams(crashForce)
+    setSimSpeed(factor)
+    slowmoActive = true
+    slowmoTimer  = dur
 end
 
 -- Crash blur: a full-screen gaussian blur via the game's ScreenBlurFX -- the SAME
@@ -717,20 +940,22 @@ end
 
 -- Death sting. The "Sound event" field accepts three things:
 --   1. A custom audio FILE ("/settings/DeathScreen/mysound.ogg", .ogg/.wav) ->
---      played 2D via Engine.Audio.playOnce on the UI channel. This is the way to
---      use your OWN sound, and it also plays THROUGH "Cut game sound" (the UI
---      channel isn't muted).
---   2. A UI FMOD event ("event:>UI>...") -> same GE path, also survives the cut.
+--      played 2D via Engine.Audio.playOnce('AudioGui', ...). This is the way to
+--      use your OWN sound. It STREAMS through AudioChannelOther, so it survives
+--      "Cut game sound" only because muteGame() deliberately leaves Other unmuted
+--      when the death sound is a loose file (see the MUTE_CHANNELS note).
+--   2. A UI FMOD event ("event:>UI>...") -> same GE path, routes through the Gui
+--      channel (never muted), so it survives the cut regardless.
 --   3. Any other FMOD event ("event:>Vehicle>Failures>engine_explode",
 --      "event:>Destruction>...") is a spatial VEHICLE sound -> the game plays it
 --      inside the vehicle's Lua via sounds.playSoundOnceFollowNode; GE playOnce
 --      does nothing for these. We route it to the vehicle's reference node (0).
 --      (These are game sounds, so they DO get muted by the sound cut.)
-local function playDeathSound()
+local function playDeathSound(ev, vol)
     pcall(function()
-        local ev = ffi.string(soundEventBuf)
+        ev = ev or ffi.string(soundEventBuf)   -- caller can pass a specific sound (e.g. the pass-out one)
         if ev == "" then return end
-        local vol = soundVolPtr[0]
+        vol = vol or soundVolPtr[0]            -- ...and its own volume (0 stays 0)
 
         local isEvent   = ev:sub(1, 6) == "event:"
         local isUIEvent = ev:find("event:>UI>", 1, true) == 1 or ev:find("event:UI", 1, true) == 1
@@ -784,7 +1009,31 @@ local function playDeathSound()
 end
 
 -- force = ignore the enabled flag (used by the Test button/keybind)
-local function triggerDeathScreen(force, crashForce)
+-- Builds the message (text + styling) portion of the JS opts string. Split out so its
+-- ~15 text pointers don't count against triggerDeathScreen's upvalues (Lua caps at 60).
+local function buildMessageOpts()
+    if not showTextPtr[0] then return "" end
+    local opts = ",text:" .. jsStr(ffi.string(textBuf))
+        .. ",textColor:" .. jsStr(hexOf(colorArr))
+        .. ",textSize:" .. math.floor(textSizePtr[0] + 0.5)
+        .. ",textDelayMs:" .. math.floor(textDelayPtr[0] * 1000 + 0.5)
+        .. ",subColor:" .. jsStr(hexOf(subColorArr))
+        .. ",subSize:" .. math.floor(subSizePtr[0] + 0.5)
+        .. ",pos:" .. textPosPtr[0]
+        .. ",bold:" .. (textBoldPtr[0] and "true" or "false")
+        .. ",italic:" .. (textItalicPtr[0] and "true" or "false")
+        .. ",spacing:" .. math.floor(textSpacingPtr[0] + 0.5)
+        .. ",font:" .. jsStr((FONTS[textFontPtr[0] + 1] or FONTS[1]).css)
+    local sub = ffi.string(subBuf)
+    if sub ~= "" then opts = opts .. ",sub:" .. jsStr(sub) end
+    if textShadowPtr[0] then
+        opts = opts .. ",shadow:true,shadowColor:" .. jsStr(hexOf(textShadowColorArr))
+            .. ",shadowStr:" .. string.format("%.3f", textShadowStrPtr[0])
+    end
+    return opts
+end
+
+local function triggerDeathScreen(force, crashForce, held)
     if isShowing then return end
     if not force and (not enabledPtr[0] or not blackoutPtr[0]) then return end
 
@@ -808,7 +1057,9 @@ local function triggerDeathScreen(force, crashForce)
         darkVal = minDark + (opacityPtr[0] - minDark) * t
     end
 
-    local fadeInMs  = math.floor(fadeInPtr[0]  * 1000 + 0.5)
+    -- A passout is a faint, not an impact: fade to black GRADUALLY (its own timer),
+    -- instead of the crash's near-instant snap.
+    local fadeInMs  = math.floor((held and PASSOUT.fadeIn[0] or fadeInPtr[0]) * 1000 + 0.5)
     local holdMs    = math.floor(holdSec * 1000 + 0.5)
     local fadeOutMs = math.floor(fadeOutPtr[0] * 1000 + 0.5)
 
@@ -822,14 +1073,8 @@ local function triggerDeathScreen(force, crashForce)
         opts = opts .. ",vigFadeInMs:"  .. (vigFadeInPtr[0]  and math.floor(vigFadeInDurPtr[0]  * 1000 + 0.5) or 0)
         opts = opts .. ",vigFadeOutMs:" .. (vigFadeOutPtr[0] and math.floor(vigFadeOutDurPtr[0] * 1000 + 0.5) or 0)
     end
-    if showTextPtr[0] then
-        opts = opts .. ",text:" .. jsStr(ffi.string(textBuf))
-        opts = opts .. ",textColor:" .. jsStr(hexOf(colorArr))
-        opts = opts .. ",textSize:" .. math.floor(textSizePtr[0] + 0.5)
-        opts = opts .. ",textDelayMs:" .. math.floor(textDelayPtr[0] * 1000 + 0.5)
-        local sub = ffi.string(subBuf)
-        if sub ~= "" then opts = opts .. ",sub:" .. jsStr(sub) end
-    end
+    if held then opts = opts .. ",hold:true" end   -- passout: hold the black until released
+    opts = opts .. buildMessageOpts()   -- message text/style opts (own fn: keeps triggerDeathScreen under the 60-upvalue cap)
     opts = opts .. "}"
 
     pcall(function()
@@ -837,27 +1082,47 @@ local function triggerDeathScreen(force, crashForce)
     end)
 
     isShowing   = true
-    activeTimer = (fadeInMs + holdMs + fadeOutMs) / 1000 + 0.25
+    heldActive  = held or false
+    activeTimer = (fadeInMs + holdMs + fadeOutMs) / 1000 + 0.25   -- (ignored while heldActive)
     if hideUIPtr[0] and windowOpen[0] then   -- get the settings window out of the shot
         windowOpen[0] = false
         uiHiddenByTrigger = true
     end
     soundBackFadeTimer = 0
+    -- Which sound this trigger plays: the main death sound on a crash; on a pass-out
+    -- (only if opted in) the pass-out sound, or the main one if that field is blank.
+    -- Resolved up front so the sound-cut's channel handling and the playback agree.
+    local soundEv, soundVol = "", soundVolPtr[0]
+    if soundPtr[0] and (not held or PASSOUT.playSound[0]) then
+        soundEv = ffi.string(soundEventBuf)
+        if held then
+            local ps = ffi.string(PASSOUT.soundBuf)
+            if ps ~= "" then soundEv = ps end
+            soundVol = PASSOUT.soundVol[0]   -- pass-out has its own volume
+        end
+    end
     if soundCutPtr[0] then
-        muteGame()
-        -- optionally bring the world back before the screen clears (hear before you see)
-        soundBackTimer = soundBackPtr[0] and math.max(0.05, soundBackAtPtr[0]) or 0
+        muteGame(soundEv)
+        -- hear-before-you-see only for a timed blackout; a held passout stays cut until release
+        soundBackTimer = (not held and soundBackPtr[0]) and math.max(0.05, soundBackAtPtr[0]) or 0
     else
         soundBackTimer = 0
     end
-    if soundPtr[0] then playDeathSound() end
-    if slowmoPtr[0] then
-        setSimSpeed(slowmoFactorPtr[0])
-        slowmoActive = true
-        slowmoTimer  = slowmoDurPtr[0]
-    end
-    armRecoveryBlur()   -- fires when the black starts lifting (handled in onUpdate)
+    if soundEv ~= "" then playDeathSound(soundEv, soundVol) end
+    if SM.on[0] and not held then triggerSlowmo(crashForce) end   -- no indefinite slow-mo for a held passout
+    armRecoveryBlur()   -- fires when the black starts lifting (handled in onUpdate / on release)
     -- clear the window so the same crash can't re-trigger the instant the cooldown ends
+    dmgWindow = {}
+    recentDamage = 0
+end
+
+-- Slow-mo WITHOUT the blackout: a crash still triggers bullet-time even though the
+-- death screen is off (Need for Speed Shift / GRID style). Mirrors the death-screen
+-- cooldown + damage-window clear so a tumbling wreck can't re-fire it every frame.
+local function triggerSlowmoOnly(crashForce)
+    if isShowing or slowmoActive then return end
+    triggerSlowmo(crashForce)
+    cooldownTimer = RETRIGGER_COOLDOWN
     dmgWindow = {}
     recentDamage = 0
 end
@@ -977,11 +1242,13 @@ local function updateDetection(dtReal)
         for i = 1, #dmgWindow do
             if dmgWindow[i].s and dmgWindow[i].s > impactSpeed then impactSpeed = dmgWindow[i].s end
         end
-        if impactSpeed >= minSpeedPtr[0] then
-            -- global master + the blackout's own toggle + re-trigger cooldown
-            if enabledPtr[0] and blackoutPtr[0] and cooldownTimer <= 0 then
+        if impactSpeed >= minSpeedPtr[0] and enabledPtr[0] and cooldownTimer <= 0 then
+            if blackoutPtr[0] then                       -- full death screen (slow-mo included)
                 lastReason = string.format("%.0f dmg @ %d km/h", recentDamage, math.floor(impactSpeed + 0.5))
                 triggerDeathScreen(false, recentDamage)
+            elseif SM.on[0] then                         -- blackout off, slow-mo on: bullet-time alone
+                lastReason = string.format("slow-mo: %.0f dmg @ %d km/h", recentDamage, math.floor(impactSpeed + 0.5))
+                triggerSlowmoOnly(recentDamage)
             end
         end
     end
@@ -992,6 +1259,7 @@ end
 --------------------------------------------------------------------------------
 local THEME = {
     { im.Col_WindowBg,         im.ImVec4(0.06, 0.03, 0.03, 0.97) },
+    { im.Col_PopupBg,          im.ImVec4(0.09, 0.04, 0.04, 0.98) },  -- dropdown / tooltip background (match the window's dark red)
     { im.Col_TitleBg,          im.ImVec4(0.12, 0.04, 0.04, 0.95) },
     { im.Col_TitleBgActive,    im.ImVec4(0.35, 0.08, 0.08, 0.98) },
     { im.Col_Border,           im.ImVec4(0.70, 0.20, 0.20, 0.45) },
@@ -1107,13 +1375,23 @@ local function drawEffects()
     local dirty = false
     --------------------------------------------------------------------------
     if section("Effects", true) then
-        if checkbox("Slow-motion on crash", slowmoPtr,
-            "Briefly slows the game down when you crash, for a dramatic replay.") then dirty = true end
-        if slowmoPtr[0] then
-            if slider("smf", "Game speed", slowmoFactorPtr, 0.05, 1.0, "%.2f",
-                "How slow it goes. 0.30 = 30 percent speed. Lower is more dramatic.") then dirty = true end
-            if slider("smd", "Slow-mo length", slowmoDurPtr, 0.0, 10.0, "%.1f s",
-                "How long the slow-motion lasts (real seconds).") then dirty = true end
+        if checkbox("Slow-motion on crash", SM.on,
+            "Briefly slows the game down when you crash, for a dramatic replay. Works even with the blackout turned off, if you just want the slow-mo (like Need for Speed Shift / RaceDriver GRID).") then dirty = true end
+        if SM.on[0] then
+            if slider("smf", "Game speed", SM.factor, 0.05, 1.0, "%.2f",
+                "How slow it goes. 0.30 = 30 percent speed. Lower is more dramatic. (With 'Scale with crash force' on, this is the deepest, for a full-blast crash.)") then dirty = true end
+            if slider("smd", "Slow-mo length", SM.dur, 0.0, 10.0, "%.1f s",
+                "How long the slow-motion lasts (real seconds). (With 'Scale with crash force' on, this is the full length, for a full-blast crash.)") then dirty = true end
+            if checkbox("Scale with crash force##slow", SM.scale,
+                "Bigger crashes get longer and deeper slow-mo. 'Slow-mo length' and 'Game speed' above become the full-blast values; set a Min equal to its max to not scale that one. Works with the blackout off too.") then dirty = true end
+            if SM.scale[0] then
+                if slider("slmind", "Min slow-mo length", SM.minDur, 0.0, 10.0, "%.1f s",
+                    "Shortest slow-mo, for a crash that just barely triggers.") then dirty = true end
+                if slider("slminf", "Mildest game speed", SM.minFactor, 0.05, 1.0, "%.2f",
+                    "Game speed for a barely-triggering crash. Higher = milder on small crashes; it deepens toward 'Game speed' as crashes get harder.") then dirty = true end
+                if slider("slfull", "Full-blast force", SM.full, 1000.0, 500000.0, "%.0f",
+                    "Crash force at or above which slow-mo hits its full length and depth. Watch 'Biggest so far' after a big crash to pick a value.") then dirty = true end
+            end
         end
 
         if checkbox("Crash blur", blurPtr,
@@ -1153,7 +1431,16 @@ local function drawEffects()
             "Play a sound the moment it triggers.") then dirty = true end
         if soundPtr[0] then
             if im.InputText("Sound", soundEventBuf, EVENT_CAP) then dirty = true end
-            helpMarker("Your OWN sound: drop a .ogg into the mod's settings/DeathScreen folder and type just its name, e.g.  hit.ogg  -- it plays even with 'Cut game sound' on.")
+            helpMarker("Your OWN sound: drop a .ogg into the mod's settings/DeathScreen folder (use the button below) and type just its name, e.g.  hit.ogg  -- it plays even with 'Cut game sound' on.")
+            if im.Button("Open sounds folder") then
+                -- open the settings/DeathScreen folder in the OS file explorer so people
+                -- know exactly where to drop their .ogg (create it first if it's not there)
+                pcall(function()
+                    if FS and not FS:directoryExists(SOUND_DIR) then FS:directoryCreate(SOUND_DIR, true) end
+                    if Engine and Engine.Platform then Engine.Platform.exploreFolder(SOUND_DIR) end
+                end)
+            end
+            helpMarker("Opens the folder where your custom sound files go, in Windows Explorer. Drop your .ogg here, then type its filename in the Sound box above.")
             if slider("svol", "Volume", soundVolPtr, 0.0, 3.0, "%.2f",
                 "Sound volume. 1.0 = normal, higher = louder.") then dirty = true end
             if checkbox("Fade out sound", soundFadePtr,
@@ -1196,9 +1483,9 @@ local function drawEffects()
     --------------------------------------------------------------------------
     if section("Damage vignette (any crash)", true) then
         if checkbox("Enable damage vignette", dmgVigPtr,
-            "FPS-style: ANY crash (even a light one, no death screen needed) flashes a coloured vignette at the screen edges that fades away. The bigger the hit, the stronger it flashes.") then dirty = true end
+            "FPS-style: ANY crash (even a light one, no death screen needed) flashes a colored vignette at the screen edges that fades away. The bigger the hit, the stronger it flashes.") then dirty = true end
         if dmgVigPtr[0] then
-            if im.ColorEdit3("Colour", dmgVigColorArr) then dirty = true end
+            if im.ColorEdit3("Color", dmgVigColorArr) then dirty = true end
             im.SameLine()
             if im.Button("Reset##dmgcol") then
                 dmgVigColorArr[0] = im.Float(DEFAULT_DMGCOLOR[1])
@@ -1209,7 +1496,7 @@ local function drawEffects()
             if slider("dvmax", "Max strength", dmgVigMaxPtr, 0.1, 1.0, "%.2f",
                 "How opaque the flash can get on the hardest hit. Lower = subtler. Set to 1.0 (with Coverage 1.0) so the biggest crashes reach fully solid.") then dirty = true end
             if slider("dvcover", "Coverage", dmgVigCoverPtr, 0.0, 1.0, "%.2f",
-                "How far it reaches in from the edges on the hardest hit. 0 = a thin rim, 1 = closes right in to the centre. Smaller hits reach in proportionally less. For a 'knocked out' look, set Coverage AND Max strength to 1.0 with a black colour -- hard crashes then close all the way to solid black, while light ones stay a partial rim.") then dirty = true end
+                "How far it reaches in from the edges on the hardest hit. 0 = a thin rim, 1 = closes right in to the centre. Smaller hits reach in proportionally less. For a 'knocked out' look, set Coverage AND Max strength to 1.0 with a black color -- hard crashes then close all the way to solid black, while light ones stay a partial rim.") then dirty = true end
             if slider("dvsoft", "Softness", dmgVigSoftPtr, 0.0, 1.0, "%.2f",
                 "How gradual the edge fade is. Low = a tight, defined ring. High = the red keeps deepening all the way to the corners, reaching full only at the very edge, so there's NO visible line where it starts fading -- a smooth, edgeless tint. Push toward 1.0 if you can still see where the fade begins.") then dirty = true end
             if slider("dvfull", "Full at damage", dmgVigFullPtr, 1000.0, 300000.0, "%.0f",
@@ -1240,6 +1527,102 @@ local function drawSoundCut()
     return dirty
 end
 
+-- "Message" section, split out so its (many) text pointers don't count against
+-- drawSettingsWindow's upvalues (Lua caps a function at 60).
+local function drawMessage()
+    local dirty = false
+    if section("Message", false) then
+        if checkbox("Show message", showTextPtr,
+            "Show a big message (like GTA's WASTED) once the screen is black.") then dirty = true end
+        if showTextPtr[0] then
+            if im.InputText("Title", textBuf, TEXT_CAP) then dirty = true end
+            if im.ColorEdit3("Title color", colorArr) then dirty = true end
+            im.SameLine()
+            if im.Button("Reset##color") then
+                colorArr[0] = im.Float(DEFAULT_COLOR[1]); colorArr[1] = im.Float(DEFAULT_COLOR[2]); colorArr[2] = im.Float(DEFAULT_COLOR[3])
+                dirty = true
+            end
+            if slider("tsize", "Title size", textSizePtr, 20.0, 240.0, "%.0f px",
+                "Font size of the title.") then dirty = true end
+
+            if im.InputText("Subtitle", subBuf, SUB_CAP) then dirty = true end
+            if im.ColorEdit3("Subtitle color", subColorArr) then dirty = true end
+            im.SameLine()
+            if im.Button("Reset##subcolor") then
+                subColorArr[0] = im.Float(DEFAULT_SUBCOLOR[1]); subColorArr[1] = im.Float(DEFAULT_SUBCOLOR[2]); subColorArr[2] = im.Float(DEFAULT_SUBCOLOR[3])
+                dirty = true
+            end
+            if slider("ssize", "Subtitle size", subSizePtr, 10.0, 200.0, "%.0f px",
+                "Font size of the subtitle.") then dirty = true end
+
+            if im.BeginCombo("Font", (FONTS[textFontPtr[0] + 1] or FONTS[1]).name) then
+                for i = 1, #FONTS do
+                    if im.Selectable1(FONTS[i].name, textFontPtr[0] == i - 1) then
+                        textFontPtr[0] = i - 1; dirty = true
+                    end
+                end
+                im.EndCombo()
+            end
+            helpMarker("Font for the message. All are standard fonts your system has.")
+            if checkbox("Bold", textBoldPtr, "Heavy weight vs normal for the message.") then dirty = true end
+            im.SameLine()
+            if checkbox("Italic", textItalicPtr, "Slant the message text.") then dirty = true end
+            if slider("tspace", "Letter spacing", textSpacingPtr, 0.0, 40.0, "%.0f px",
+                "Space between the title's letters.") then dirty = true end
+
+            if checkbox("Shadow / glow", textShadowPtr, "A soft halo behind the text so it pops off the black.") then dirty = true end
+            if textShadowPtr[0] then
+                if im.ColorEdit3("Shadow color", textShadowColorArr) then dirty = true end
+                im.SameLine()
+                if im.Button("Reset##shcolor") then
+                    textShadowColorArr[0] = im.Float(DEFAULT_SHADOW[1]); textShadowColorArr[1] = im.Float(DEFAULT_SHADOW[2]); textShadowColorArr[2] = im.Float(DEFAULT_SHADOW[3])
+                    dirty = true
+                end
+                if slider("shstr", "Shadow spread", textShadowStrPtr, 0.0, 1.0, "%.2f",
+                    "How far the halo/glow spreads. Higher = softer, wider.") then dirty = true end
+            end
+
+            im.Text("Position:"); im.SameLine()
+            if im.RadioButton2("Top", textPosPtr, 0) then dirty = true end
+            im.SameLine(); if im.RadioButton2("Center", textPosPtr, 1) then dirty = true end
+            im.SameLine(); if im.RadioButton2("Bottom", textPosPtr, 2) then dirty = true end
+
+            if slider("tdelay", "Text delay", textDelayPtr, 0.0, 3.0, "%.2f s",
+                "Waits this long after the screen is black, then the text slams in (GTA-style).") then dirty = true end
+        end
+    end
+    return dirty
+end
+
+-- Presets section: name + Save, and a list of saved presets with Load / delete.
+-- (Load/Save/delete each persist on their own, so nothing to return.)
+local function drawPresets()
+    if section("Presets", false) then
+        im.PushItemWidth(im.GetContentRegionAvailWidth() * 0.58)
+        im.InputText("##presetname", presetNameBuf, PRESET_CAP)
+        im.PopItemWidth()
+        im.SameLine()
+        if im.Button("Save preset") then
+            savePreset(ffi.string(presetNameBuf):match("^%s*(.-)%s*$"))
+        end
+        helpMarker("Type a name and hit Save to store ALL your current settings as a preset. Load one below to switch to it instantly. Great for a 'cinematic' set vs a 'subtle' set, etc.")
+        local names = {}
+        for k in pairs(presets) do names[#names + 1] = k end
+        table.sort(names)
+        if #names == 0 then
+            im.TextDisabled("No presets saved yet.")
+        else
+            for _, name in ipairs(names) do
+                if im.Button("Load##p_" .. name) then loadPreset(name) end
+                im.SameLine()
+                if im.Button("X##p_" .. name) then deletePreset(name) end
+                im.SameLine()
+                im.Text(name)
+            end
+        end
+    end
+end
+
 local function drawSettingsWindow()
     local nCol, nVar = pushTheme()
     -- Cap the window height to the screen so it never overflows small resolutions
@@ -1263,6 +1646,9 @@ local function drawSettingsWindow()
             im.TextColored(im.ImVec4(1.00, 0.82, 0.40, 1.00),
                 "Reopen via Options > Controls > Death Screen.")
         end
+
+        --------------------------------------------------------------------------
+        drawPresets()
 
         --------------------------------------------------------------------------
         if section("Blackout", true) then
@@ -1291,10 +1677,28 @@ local function drawSettingsWindow()
 
         --------------------------------------------------------------------------
         if section("When it triggers", true) then
-            if slider("sev", "Crash severity", thresholdPtr, 500.0, 200000.0, "%.0f",
+            if slider("sev", "Crash severity", thresholdPtr, 500.0, 500000.0, "%.0f",
                 "How hard a crash has to be to trigger. Higher = only bigger crashes count. Use the readout below to tune it.") then dirty = true end
             if slider("spd", "Min speed", minSpeedPtr, 0.0, 60.0, "%.0f km/h",
                 "Won't trigger unless you were going at least this fast. Blocks false alarms from fire or slow crushing.") then dirty = true end
+            if checkbox("Pass out when upside down", PASSOUT.on,
+                "A second way to trigger the blackout: if you're left upside down (on the roof) for long enough, the driver passes out. The black screen HOLDS until you're flipped back over or you reset. No crash needed. (Needs the global 'Enabled' and 'Enable blackout' on.)") then dirty = true end
+            if PASSOUT.on[0] then
+                if slider("fliptime", "Upside-down time", PASSOUT.time, 1.0, 30.0, "%.1f s",
+                    "How long you have to be upside down before you pass out. Righting the car resets the timer.") then dirty = true end
+                if slider("flipfin", "Pass-out fade", PASSOUT.fadeIn, 0.0, 5.0, "%.1f s",
+                    "How slowly the screen fades to black as you pass out. Unlike a crash (a sudden snap), this is a gradual faint. 0 = instant.") then dirty = true end
+                if slider("flipfout", "Come-to fade", PASSOUT.fadeOut, 0.0, 5.0, "%.1f s",
+                    "How slowly your vision returns when you're flipped back over or reset. 0 = instant.") then dirty = true end
+                if checkbox("Play death sound on pass-out", PASSOUT.playSound,
+                    "When you pass out from being upside down, also play a sound (crashes still use the main Death sound). Off = stay silent on a pass-out. Needs 'Death sound' turned on under Effects.") then dirty = true end
+                if PASSOUT.playSound[0] then
+                    if im.InputText("Pass-out sound", PASSOUT.soundBuf, EVENT_CAP) then dirty = true end
+                    helpMarker("Optional: a DIFFERENT sound for passing out, e.g. faint.ogg. Same folder as the Death sound (use its 'Open sounds folder' button under Effects). Leave blank to reuse your main Death sound.")
+                    if slider("flipvol", "Pass-out volume", PASSOUT.soundVol, 0.0, 3.0, "%.2f",
+                        "How loud the pass-out sound plays (1.0 = normal). Separate from the crash Death sound's volume.") then dirty = true end
+                end
+            end
             im.Dummy(im.ImVec2(0, 3))
             im.Text(string.format("Current crash force: %.0f", recentDamage))
             im.Text(string.format("Biggest so far: %.0f", peakDamage))
@@ -1304,26 +1708,7 @@ local function drawSettingsWindow()
         end
 
         --------------------------------------------------------------------------
-        if section("Message", false) then
-            if checkbox("Show message", showTextPtr,
-                "Show a big centered message (like GTA's WASTED) once the screen is black.") then dirty = true end
-            if showTextPtr[0] then
-                if im.InputText("Title", textBuf, TEXT_CAP) then dirty = true end
-                if im.InputText("Subtitle", subBuf, SUB_CAP) then dirty = true end
-                if im.ColorEdit3("Text color", colorArr) then dirty = true end
-                im.SameLine()
-                if im.Button("Reset##color") then
-                    colorArr[0] = im.Float(DEFAULT_COLOR[1])
-                    colorArr[1] = im.Float(DEFAULT_COLOR[2])
-                    colorArr[2] = im.Float(DEFAULT_COLOR[3])
-                    dirty = true
-                end
-                if slider("tsize", "Text size", textSizePtr, 20.0, 240.0, "%.0f px",
-                    "Font size of the title.") then dirty = true end
-                if slider("tdelay", "Text delay", textDelayPtr, 0.0, 3.0, "%.2f s",
-                    "Waits this long after the screen is black, then the text slams in (GTA-style).") then dirty = true end
-            end
-        end
+        if drawMessage() then dirty = true end   -- Message section (own function: keeps upvalues under Lua's 60 limit)
 
         --------------------------------------------------------------------------
         if drawEffects() then dirty = true end   -- Effects + Damage vignette (own function: keeps upvalues under Lua's 60 limit)
@@ -1420,6 +1805,7 @@ end
 local function cancelDeathScreen()
     hideOverlayJS()
     isShowing = false
+    heldActive = false
     activeTimer = 0
     soundBackTimer = 0
     soundBackFadeTimer = 0
@@ -1449,6 +1835,67 @@ local function inGameplay()
     end)
     return ok and res == true
 end
+
+-- "Pass out" trigger: if the car is left upside down (roof-down) long enough, the
+-- driver blacks out -- and unlike a crash blackout it HOLDS until you're flipped back
+-- over or you reset. The vehicle's up-vector points to world-up (z near 1) when upright
+-- and flips to z near -1 on its roof. Pass out below -0.5 (clearly inverted; on its side
+-- is ~0). Come to once it's rolled back past -0.2 (hysteresis so it doesn't flicker).
+local FLIP_THRESHOLD = -0.5   -- pass out below this
+local FLIP_RELEASE   = -0.2   -- come to once back above this
+local flipTimer = 0
+local function readUpZ()
+    local z
+    pcall(function()
+        local veh = be:getPlayerVehicle(0)
+        if veh then z = vec3(veh:getDirectionVectorUp()).z end
+    end)
+    return z
+end
+
+-- end a held passout blackout: fade the black back out, regain vision, return audio
+local function releasePassout()
+    if not heldActive then return end
+    heldActive = false
+    isShowing  = false
+    flipTimer  = 0
+    pcall(function()
+        be:executeJS("window.__DeathScreen && window.__DeathScreen.release(" ..
+            math.floor(PASSOUT.fadeOut[0] * 1000 + 0.5) .. ");")
+    end)
+    if recoveryBlurPtr[0] then fireRecoveryBlur() end   -- vision returns as the black lifts
+    if soundCutActive then                              -- bring the muted audio back (swell if set)
+        local fade = soundBackFadePtr[0]
+        if fade > 0 then soundBackFadeDur = fade; soundBackFadeTimer = fade else unmuteGame() end
+    end
+    restoreHiddenUI()
+    cooldownTimer = RETRIGGER_COOLDOWN
+end
+
+local function updateFlipout(dt)
+    -- holding a passout blackout: release the instant we're flipped back (or lose the vehicle)
+    if heldActive then
+        local z = readUpZ()
+        if (not z) or z > FLIP_RELEASE then releasePassout() end
+        return
+    end
+    if not (enabledPtr[0] and blackoutPtr[0] and PASSOUT.on[0]) or isShowing or cooldownTimer > 0 then
+        flipTimer = 0
+        return
+    end
+    local z = readUpZ()
+    if z and z < FLIP_THRESHOLD then
+        flipTimer = flipTimer + (dt or 0)
+        if flipTimer >= PASSOUT.time[0] then
+            flipTimer = 0
+            lastReason = "passed out (upside down)"
+            triggerDeathScreen(false, nil, true)   -- HELD full blackout until righted / reset
+        end
+    else
+        flipTimer = 0                    -- righted itself (or only on its side): reset
+    end
+end
+
 local function onUpdate(dtReal)
     if deactivated then
         -- our mod was disabled: stop everything and unload ourselves (deferred here so
@@ -1458,6 +1905,7 @@ local function onUpdate(dtReal)
         return
     end
     updateDetection(dtReal)
+    updateFlipout(dtReal)
     updateDamageVignette(dtReal)
     updateBlur(dtReal)
 
@@ -1486,7 +1934,7 @@ local function onUpdate(dtReal)
         end
     end
 
-    if isShowing then
+    if isShowing and not heldActive then   -- a held passout doesn't tick down; it's released by updateFlipout
         activeTimer = activeTimer - (dtReal or 0)
         -- fire the recovery blur right as the black starts lifting (the fade-back phase),
         -- so the world is blurry as it appears and then sharpens = regaining vision
@@ -1501,7 +1949,7 @@ local function onUpdate(dtReal)
             cooldownTimer = RETRIGGER_COOLDOWN
             restoreHiddenUI()     -- bring the settings window back if we hid it
         end
-    elseif cooldownTimer > 0 then
+    elseif cooldownTimer > 0 and not heldActive then
         cooldownTimer = cooldownTimer - (dtReal or 0)
     end
 
@@ -1523,6 +1971,8 @@ local function onUpdate(dtReal)
     end
 
     if inGameplay() then
+        installUI()   -- inject the overlay + warm up the message fonts EARLY (self-guards),
+                      -- so fonts are fully loaded well before any crash (no first-render swap)
         drawFirstRunNotice()   -- one-time keybind help for fresh installs (self-guards)
 
         if windowOpen[0] then
