@@ -1035,7 +1035,10 @@ end
 
 local function triggerDeathScreen(force, crashForce, held)
     if isShowing then return end
-    if not force and (not enabledPtr[0] or not blackoutPtr[0]) then return end
+    -- crash blackout is gated by 'Enable blackout'; a pass-out (held) is its own trigger
+    -- and only needs the global 'Enabled', so it works even with the blackout turned off
+    if not force and not enabledPtr[0] then return end
+    if not force and not held and not blackoutPtr[0] then return end
 
     installUI()
     if not uiInstalled then return end
@@ -1682,7 +1685,7 @@ local function drawSettingsWindow()
             if slider("spd", "Min speed", minSpeedPtr, 0.0, 60.0, "%.0f km/h",
                 "Won't trigger unless you were going at least this fast. Blocks false alarms from fire or slow crushing.") then dirty = true end
             if checkbox("Pass out when upside down", PASSOUT.on,
-                "A second way to trigger the blackout: if you're left upside down (on the roof) for long enough, the driver passes out. The black screen HOLDS until you're flipped back over or you reset. No crash needed. (Needs the global 'Enabled' and 'Enable blackout' on.)") then dirty = true end
+                "A second way to trigger the blackout: if you're left upside down (on the roof) for long enough, the driver passes out. The black screen HOLDS until you're flipped back over or you reset. No crash needed. Works even with 'Enable blackout' OFF (pass-out blackouts without crash blackouts) - only the global 'Enabled' has to be on.") then dirty = true end
             if PASSOUT.on[0] then
                 if slider("fliptime", "Upside-down time", PASSOUT.time, 1.0, 30.0, "%.1f s",
                     "How long you have to be upside down before you pass out. Righting the car resets the timer.") then dirty = true end
@@ -1879,7 +1882,7 @@ local function updateFlipout(dt)
         if (not z) or z > FLIP_RELEASE then releasePassout() end
         return
     end
-    if not (enabledPtr[0] and blackoutPtr[0] and PASSOUT.on[0]) or isShowing or cooldownTimer > 0 then
+    if not (enabledPtr[0] and PASSOUT.on[0]) or isShowing or cooldownTimer > 0 then   -- passout is independent of 'Enable blackout'
         flipTimer = 0
         return
     end
