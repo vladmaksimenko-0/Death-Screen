@@ -1,0 +1,38 @@
+{
+    "toggleDeathScreenUI": {
+        "cat": "DeathScreen",
+        "order": 0,
+        "ctx": "tlua",
+        "onUp": "DeathScreen.toggleUI()",
+        "isBasic": true,
+        "title": "Death Screen: Settings",
+        "desc": "Show or hide the Death Screen settings window"
+    },
+    "toggleDeathScreenEnabled": {
+        "cat": "DeathScreen",
+        "order": 1,
+        "ctx": "tlua",
+        "onUp": "DeathScreen.toggleEnabled()",
+        "isBasic": true,
+        "title": "Death Screen: On/Off",
+        "desc": "Turn the death screen on or off (shows a quick toast)"
+    },
+    "testDeathScreen": {
+        "cat": "DeathScreen",
+        "order": 2,
+        "ctx": "tlua",
+        "onUp": "DeathScreen.test()",
+        "isBasic": true,
+        "title": "Death Screen: Test",
+        "desc": "Manually trigger the blackout to preview / tune it"
+    },
+    "testDeathScreenBlur": {
+        "cat": "DeathScreen",
+        "order": 3,
+        "ctx": "tlua",
+        "onUp": "DeathScreen.testBlur()",
+        "isBasic": true,
+        "title": "Death Screen: Test Blur",
+        "desc": "Manually trigger the experimental crash blur to preview it"
+    }
+}
