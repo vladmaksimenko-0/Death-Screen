@@ -13,6 +13,7 @@ Works in singleplayer freeroam and in multiplayer (no server-side setup needed).
 - **Damage vignette** - an FPS-style colored edge flash on *any* crash, even light ones.
 - **Cut game sound** during the blackout, with the world's audio returning *before* your vision does.
 - **Pass out when upside down** - left on your roof too long and the driver blacks out, no crash needed.
+- **Injury report (experimental)** - reads your car's *real crash deformation* to list the injuries you'd have sustained: where you got hit, whether the crumple zones saved you, and how badly.
 - Optional **slow-motion** (scales with the crash, works with *or* without the blackout), a **custom death sound**, and a fully-styled **on-screen message** (17 fonts, title + subtitle colors and sizes, glow, and screen position).
 - **Presets** - save your whole setup under a name and switch between them (a "cinematic" set, a "subtle" set...).
 - One **global master switch**, per-effect toggles, and a **reset all to defaults** button.
@@ -101,6 +102,21 @@ The window shows a **live damage readout** and a **peak**. To dial the threshold
 | Text shadow / glow | on | - | A soft glow behind the text (defaults to a subtle red so it reads against the black), with its own color and spread. |
 | Position | Center | - | Put the message at the top, center, or bottom of the screen. |
 | Text delay | 0.26 s | 0 - 3 | How long after full-black before the message fades in. |
+
+### Injury report (experimental, off by default)
+
+After a crash, an on-screen report lists the "injuries" you sustained. It reads the car's *actual crash deformation* to tell where you got hit (front / rear / driver- or passenger-side / rollover) and whether the crush reached your seat: crumple-zone hits are survivable, cabin intrusion is not, side impacts are deadlier than head-ons at the same speed, and past ~200 km/h nothing saves you. Pure roleplay flavour - odd multi-hit crashes can misread.
+
+| Setting | Default | Range | What it does |
+| --- | --- | --- | --- |
+| Show injury report | off | - | The report itself. Works with or without the blackout. |
+| Darkly funny | off | - | Clinical ("Fractured rib") vs dark humour ("Spleen has left the chat"). |
+| Deformation-based detection | on | - | Reads the car's actual crush for direction + cabin intrusion (recommended). Off = a lighter impulse-only guess. |
+| Show impact direction | on | - | Lead the report with the detected impact ("Frontal impact", "Driver's-side impact"...). Off = just the injuries. |
+| Injury text size | 26 px | 10 - 60 | Font size of the report. |
+| Injury text color | pale red | - | Full color picker (with a Reset). |
+| Survivability | 1.0x | 0.5 - 2.0 | Higher = survive harder hits (roll-cage builds), lower = fragile. |
+| Allow fatal injuries | on | - | Off = you always "survive" - injuries still listed, just no death line. |
 
 ### Effects
 

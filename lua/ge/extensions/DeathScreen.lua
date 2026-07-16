@@ -116,14 +116,17 @@ local dmgVigFadePtr   = im.FloatPtr(1.5)   -- seconds to fade back to nothing
 local dmgVigColorArr  = im.ArrayFloat(3)   -- edge color (RGB 0..1)
 
 -- Crash blur: a full-screen gaussian blur on crash (the game's menu-background blur).
-local blurPtr         = im.BoolPtr(true)
-local blurAmtPtr      = im.FloatPtr(0.8)   -- how strong the blur is (0..1)
-local blurDurPtr      = im.FloatPtr(1.2)   -- how long it holds at full before easing off (s)
-local blurTrigPtr     = im.FloatPtr(30000) -- crash force needed to set the blur off (its own, lower threshold)
-local blurFadeInPtr   = im.BoolPtr(true)   -- ease the blur in (vs snap on)
-local blurFadeInDurPtr= im.FloatPtr(0.4)   -- blur fade-in length (s)
-local blurFadeOutPtr  = im.BoolPtr(true)   -- ease the blur out (vs snap off)
-local blurFadeOutDurPtr=im.FloatPtr(0.6)   -- blur fade-out length (s)
+-- Crash-blur settings grouped in a table (LuaJIT 200-locals-per-chunk cap; same as SM/PASSOUT/INJ)
+local BLUR = {
+    on         = im.BoolPtr(true),
+    amt        = im.FloatPtr(0.8),    -- how strong the blur is (0..1)
+    dur        = im.FloatPtr(1.2),    -- how long it holds at full before easing off (s)
+    trig       = im.FloatPtr(30000),  -- crash force needed to set the blur off (its own, lower threshold)
+    fadeIn     = im.BoolPtr(true),    -- ease the blur in (vs snap on)
+    fadeInDur  = im.FloatPtr(0.4),    -- blur fade-in length (s)
+    fadeOut    = im.BoolPtr(true),    -- ease the blur out (vs snap off)
+    fadeOutDur = im.FloatPtr(0.6),    -- blur fade-out length (s)
+}
 -- Recovery blur: after a blackout, blur the screen as it fades back in and clear it, as
 -- if you're regaining your vision. Reuses the same full-screen blur as the crash blur.
 local recoveryBlurPtr    = im.BoolPtr(true)   -- blur the screen as the blackout lifts
@@ -135,6 +138,7 @@ local DEFAULT_TINT    = {0.45, 0.02, 0.02}     -- dark-red vignette edges
 local DEFAULT_DMGCOLOR= {0.75, 0.04, 0.04}     -- FPS damage red
 local DEFAULT_SUBCOLOR= {0.874, 0.890, 0.902}  -- #dfe3e6 light grey subtitle
 local DEFAULT_SHADOW  = {0.667, 0.0, 0.0}      -- #AA0000 dark-red glow (black is invisible on black)
+local DEFAULT_INJCOLOR= {0.910, 0.706, 0.706}  -- #e8b4b4 pale clinical red for the injury report
 -- Message fonts (CSS font-family stacks). Index 0 = default; stored by index
 -- (textFontPtr) and applied to the overlay in the JS. The first group are fonts BeamNG
 -- itself bundles + registers via @font-face in its UI (our overlay lives in the same
@@ -164,6 +168,56 @@ local windowOpen   = im.BoolPtr(true)     -- the settings window (open on first 
 local hideUIPtr    = im.BoolPtr(true)     -- hide this window while the death screen is showing
 
 -- rolling damage window
+-- Injury report (Tier 1: severity-based flavour). INJURIES[tone][tier] = a pool of lines;
+-- tier (1..4) is picked from crash force. Deliberately structured so a REGION dimension
+-- (directional injuries, Tier 2) and real part-damage (Tier 3) can slot in later without
+-- reworking the picker. Pure roleplay flavour -- not medical, not serious.
+local INJ = {
+    on    = im.BoolPtr(false),   -- show an "injuries sustained" report on the death screen
+    funny = im.BoolPtr(false),   -- tone: false = clinical, true = darkly funny
+    size  = im.FloatPtr(26.0),   -- injury line font size (px)
+    tough = im.FloatPtr(1.0),    -- survivability: multiplies the speed-tier thresholds (roll cage etc.)
+    showFatal = im.BoolPtr(true),-- allow the "deceased" capstone on the worst crashes (off = always survive)
+    deform = im.BoolPtr(true),   -- deformation-based detection (reads the real crush; off = impulse-only guess)
+    color  = im.ArrayFloat(3),   -- injury text color (defaults set below)
+    showDir = im.BoolPtr(true),  -- lead the report with the detected impact ("Frontal impact" etc.)
+    -- pools[tone][region] = {minor=, major=} by impact direction; plus a per-tone `fatal`
+    -- capstone for the worst crashes. Nested in INJ so it isn't a separate top-level local.
+    pools = {
+        clinical = {
+            front    = { minor = { "Whiplash", "Bruised sternum", "Seatbelt abrasion", "Knee contusion", "Split lip" },
+                         major = { "Fractured sternum", "Facial fractures", "Shattered kneecaps", "Femur fracture", "Flail chest", "Traumatic brain injury" } },
+            rear     = { minor = { "Whiplash", "Strained neck", "Sore lower back", "Mild concussion" },
+                         major = { "Cervical spine fracture", "Severe whiplash", "Herniated disc", "Fractured vertebra", "Concussion" } },
+            side     = { minor = { "Bruised ribs", "Sore hip", "Shoulder strain", "Lateral bruising" },
+                         major = { "Fractured ribs", "Pelvic fracture", "Ruptured spleen", "Collapsed lung", "Dislocated shoulder", "Fractured humerus" } },
+            rollover = { minor = { "Neck strain", "Scalp laceration", "Bruised spine", "Sore shoulders" },
+                         major = { "Cervical spine fracture", "Skull fracture", "Crush injuries", "Spinal cord damage", "Traumatic brain injury" } },
+            fatal    = { "Cause of death: blunt force trauma", "Pronounced dead at the scene", "Non-survivable trauma" },
+        },
+        funny = {
+            front    = { minor = { "Ate the steering wheel", "Airbag to the face, 0/10", "Dashboard kiss", "Knees to the chin" },
+                         major = { "Became one with the dashboard", "Faceplant, professional grade", "Ribs: rearranged", "Kneecaps: gone", "Windshield speedrun" } },
+            rear     = { minor = { "Whiplash (worth it)", "Neck went boing", "Rear-ended, respectfully", "Head, meet headrest" },
+                         major = { "Neck folded backwards", "Spine went accordion", "Whiplash: legendary tier", "Head snapped like a Pez dispenser" } },
+            side     = { minor = { "Ribs met the door", "Door-shaped bruise", "Shoulder check (literal)", "Hip took the hit" },
+                         major = { "T-boned into oblivion", "Ribs now a xylophone", "Pelvis: rearranged", "Spleen has left the chat", "Door became interior decor" } },
+            rollover = { minor = { "Bat impression: successful", "Dizzy but alive", "Rolled like a burrito", "Neck went sideways" },
+                         major = { "Tumble dry: complete", "Became a human pretzel", "Roof, meet skull", "Ragdoll mode: permanent" } },
+            fatal    = { "Deceased, respectfully", "Speedran to the afterlife", "Soul ejected at Mach 1", "Insurance fraud (successful)" },
+        },
+    },
+    -- per-region impact-speed tiers {t2,t3,t4} km/h: front is most survivable (crumple zone +
+    -- airbags), side/rollover the least. Injury tier = max(damage tier, this speed tier).
+    sevSpeed = { front = { 55, 110, 175 }, rear = { 55, 120, 190 }, side = { 30, 65, 105 }, rollover = { 32, 68, 120 } },
+    -- lead-in line atop the report so the detected impact direction/side is visible
+    context = {
+        clinical = { front = "Frontal impact", rear = "Rear impact", sideLeft = "Driver's-side impact", sideRight = "Passenger's-side impact", rollover = "Rollover" },
+        funny    = { front = "Went in nose-first", rear = "Rear-ended", sideLeft = "Driver's side took it", sideRight = "Passenger got sacrificed", rollover = "Full tumble-dry" },
+    },
+}
+pcall(function() math.randomseed(os.time()) end)   -- so the injury picks vary between sessions
+
 local WINDOW_SEC   = 0.8
 
 local function setBuf(buf, cap, s)
@@ -185,6 +239,7 @@ dmgVigColorArr[0] = im.Float(DEFAULT_DMGCOLOR[1])
 dmgVigColorArr[1] = im.Float(DEFAULT_DMGCOLOR[2])
 dmgVigColorArr[2] = im.Float(DEFAULT_DMGCOLOR[3])
 for i = 0, 2 do subColorArr[i]        = im.Float(DEFAULT_SUBCOLOR[i + 1]) end
+for i = 0, 2 do INJ.color[i]          = im.Float(DEFAULT_INJCOLOR[i + 1]) end
 for i = 0, 2 do textShadowColorArr[i] = im.Float(DEFAULT_SHADOW[i + 1]) end
 
 -- which collapsible sections are expanded, remembered across restarts. Keyed by
@@ -220,14 +275,14 @@ local function saveSettings2(t)
     t.dmgVigFull    = dmgVigFullPtr[0]
     t.dmgVigFade    = dmgVigFadePtr[0]
     t.dmgVigColor   = { tonumber(dmgVigColorArr[0]), tonumber(dmgVigColorArr[1]), tonumber(dmgVigColorArr[2]) }
-    t.blur          = blurPtr[0]
-    t.blurAmt       = blurAmtPtr[0]
-    t.blurDur       = blurDurPtr[0]
-    t.blurTrig      = blurTrigPtr[0]
-    t.blurFadeIn    = blurFadeInPtr[0]
-    t.blurFadeInDur = blurFadeInDurPtr[0]
-    t.blurFadeOut   = blurFadeOutPtr[0]
-    t.blurFadeOutDur= blurFadeOutDurPtr[0]
+    t.blur          = BLUR.on[0]
+    t.blurAmt       = BLUR.amt[0]
+    t.blurDur       = BLUR.dur[0]
+    t.blurTrig      = BLUR.trig[0]
+    t.blurFadeIn    = BLUR.fadeIn[0]
+    t.blurFadeInDur = BLUR.fadeInDur[0]
+    t.blurFadeOut   = BLUR.fadeOut[0]
+    t.blurFadeOutDur= BLUR.fadeOutDur[0]
     t.recoveryBlur    = recoveryBlurPtr[0]
     t.recoveryBlurAmt = recoveryBlurAmtPtr[0]
     t.recoveryBlurDur = recoveryBlurDurPtr[0]
@@ -262,6 +317,14 @@ local function buildSettings()
             flipFadeOut = PASSOUT.fadeOut[0],
             flipPlaySound = PASSOUT.playSound[0],
             flipAngle   = PASSOUT.angle[0],
+            injReport   = INJ.on[0],
+            injFunny    = INJ.funny[0],
+            injSize     = INJ.size[0],
+            injTough    = INJ.tough[0],
+            injFatal    = INJ.showFatal[0],
+            injDeform   = INJ.deform[0],
+            injShowDir  = INJ.showDir[0],
+            injColor    = { tonumber(INJ.color[0]), tonumber(INJ.color[1]), tonumber(INJ.color[2]) },
             opacity     = opacityPtr[0],
             scale       = scalePtr[0],
             scaleMin    = scaleMinPtr[0],
@@ -339,14 +402,14 @@ local function loadSettings2(s)
             dmgVigColorArr[i] = im.Float(math.max(0.0, math.min(1.0, v)))
         end
     end
-    if s.blur     ~= nil then blurPtr[0]     = (s.blur == true) end
-    if s.blurAmt  ~= nil then blurAmtPtr[0]  = math.max(0.05, math.min(1.0, tonumber(s.blurAmt) or 0.8)) end
-    if s.blurDur  ~= nil then blurDurPtr[0]  = math.max(0.1, math.min(8.0, tonumber(s.blurDur) or 1.2)) end
-    if s.blurTrig ~= nil then blurTrigPtr[0] = math.max(1000.0, math.min(300000.0, tonumber(s.blurTrig) or 30000)) end
-    if s.blurFadeIn     ~= nil then blurFadeInPtr[0]     = (s.blurFadeIn == true) end
-    if s.blurFadeInDur  ~= nil then blurFadeInDurPtr[0]  = math.max(0.0, math.min(5.0, tonumber(s.blurFadeInDur) or 0.4)) end
-    if s.blurFadeOut    ~= nil then blurFadeOutPtr[0]    = (s.blurFadeOut == true) end
-    if s.blurFadeOutDur ~= nil then blurFadeOutDurPtr[0] = math.max(0.0, math.min(5.0, tonumber(s.blurFadeOutDur) or 0.6)) end
+    if s.blur     ~= nil then BLUR.on[0]     = (s.blur == true) end
+    if s.blurAmt  ~= nil then BLUR.amt[0]  = math.max(0.05, math.min(1.0, tonumber(s.blurAmt) or 0.8)) end
+    if s.blurDur  ~= nil then BLUR.dur[0]  = math.max(0.1, math.min(8.0, tonumber(s.blurDur) or 1.2)) end
+    if s.blurTrig ~= nil then BLUR.trig[0] = math.max(1000.0, math.min(300000.0, tonumber(s.blurTrig) or 30000)) end
+    if s.blurFadeIn     ~= nil then BLUR.fadeIn[0]     = (s.blurFadeIn == true) end
+    if s.blurFadeInDur  ~= nil then BLUR.fadeInDur[0]  = math.max(0.0, math.min(5.0, tonumber(s.blurFadeInDur) or 0.4)) end
+    if s.blurFadeOut    ~= nil then BLUR.fadeOut[0]    = (s.blurFadeOut == true) end
+    if s.blurFadeOutDur ~= nil then BLUR.fadeOutDur[0] = math.max(0.0, math.min(5.0, tonumber(s.blurFadeOutDur) or 0.6)) end
     if s.recoveryBlur    ~= nil then recoveryBlurPtr[0]    = (s.recoveryBlur == true) end
     if s.recoveryBlurAmt ~= nil then recoveryBlurAmtPtr[0] = math.max(0.05, math.min(1.0, tonumber(s.recoveryBlurAmt) or 0.8)) end
     if s.recoveryBlurDur ~= nil then recoveryBlurDurPtr[0] = math.max(0.1, math.min(8.0, tonumber(s.recoveryBlurDur) or 1.5)) end
@@ -388,6 +451,16 @@ local function loadSettings(sIn)
         if s.flipFadeOut ~= nil then PASSOUT.fadeOut[0] = math.max(0.0, math.min(5.0, tonumber(s.flipFadeOut) or 1.2)) end
         if s.flipPlaySound ~= nil then PASSOUT.playSound[0] = (s.flipPlaySound == true) end
         if s.flipAngle    ~= nil then PASSOUT.angle[0]     = math.max(90.0, math.min(170.0, tonumber(s.flipAngle) or 120.0)) end
+        if s.injReport    ~= nil then INJ.on[0]    = (s.injReport == true) end
+        if s.injFunny     ~= nil then INJ.funny[0] = (s.injFunny == true) end
+        if s.injSize      ~= nil then INJ.size[0]  = math.max(10.0, math.min(60.0, tonumber(s.injSize) or 26.0)) end
+        if s.injTough     ~= nil then INJ.tough[0] = math.max(0.5, math.min(2.0, tonumber(s.injTough) or 1.0)) end
+        if s.injFatal     ~= nil then INJ.showFatal[0] = (s.injFatal == true) end
+        if s.injDeform    ~= nil then INJ.deform[0] = (s.injDeform == true) end
+        if s.injShowDir   ~= nil then INJ.showDir[0] = (s.injShowDir == true) end
+        if type(s.injColor) == "table" and #s.injColor >= 3 then
+            for i = 0, 2 do INJ.color[i] = im.Float(math.max(0.0, math.min(1.0, tonumber(s.injColor[i + 1]) or 0))) end
+        end
         if s.opacity   ~= nil then opacityPtr[0]   = math.max(0.3, math.min(1.0,  tonumber(s.opacity)  or 1.0)) end
         if s.scale       ~= nil then scalePtr[0]        = (s.scale == true) end
         if s.scaleMin    ~= nil then scaleMinPtr[0]     = math.max(0.1, math.min(15.0, tonumber(s.scaleMin) or 1.5)) end
@@ -469,7 +542,7 @@ local OVERLAY_JS = [==[
 (function(){
   if(window.__DeathScreen) return;
   var ds = window.__DeathScreen = {};
-  var overlay=null, vig=null, txt=null, sub=null, dmgVig=null, timers=[], toastEl=null, toastT=null, warmEl=null;
+  var overlay=null, vig=null, txt=null, sub=null, inj=null, dmgVig=null, timers=[], toastEl=null, toastT=null, warmEl=null;
   function clearTimers(){ for(var i=0;i<timers.length;i++){clearTimeout(timers[i]);} timers=[]; }
   function hexRgba(h,a){ h=(''+h).replace('#',''); if(h.length===3){h=h[0]+h[0]+h[1]+h[1]+h[2]+h[2];} var n=parseInt(h,16)||0; return 'rgba('+((n>>16)&255)+','+((n>>8)&255)+','+(n&255)+','+a+')'; }
   function ensure(){
@@ -497,7 +570,14 @@ local OVERLAY_JS = [==[
     sub=document.createElement('div'); sub.id='dsSub';
     sub.style.cssText='color:#dfe3e6;font-size:24px;font-weight:600;margin-top:12px;'
       +'opacity:0;transition:opacity .45s ease;text-align:center;position:relative;';
-    overlay.appendChild(vig); overlay.appendChild(txt); overlay.appendChild(sub);
+    inj=document.createElement('div'); inj.id='dsInj';
+    /* subtle dark card behind the report -- ~invisible on the black screen, but keeps the
+       text readable when there's no blackout and it floats over live gameplay */
+    inj.style.cssText='color:#e8b4b4;font-size:26px;font-weight:600;margin-top:22px;line-height:1.55;'
+      +'opacity:0;transition:opacity .5s ease;text-align:center;position:relative;'
+      +'background:rgba(8,0,0,.55);padding:14px 30px;border-radius:12px;'
+      +'border:1px solid rgba(255,110,110,.14);box-shadow:0 8px 40px rgba(0,0,0,.5);';
+    overlay.appendChild(vig); overlay.appendChild(txt); overlay.appendChild(sub); overlay.appendChild(inj);
     document.body.appendChild(overlay);
     /* Force every custom message font to fully LOAD AND LAY OUT by rendering hidden
        sample text in each one, kept permanently offscreen. This is more reliable than
@@ -553,6 +633,8 @@ local OVERLAY_JS = [==[
     txt.style.transition='none'; sub.style.transition='none';
     txt.style.opacity='0'; sub.style.opacity='0';
     txt.style.transform='none'; sub.style.transform='none';   /* no scale/slide = no resize/move; clean fade only */
+    /* injury report is populated ASYNC (after the deform query) via ds.showInjuries; prime hidden */
+    inj.style.transition='none'; inj.style.opacity='0'; inj.innerHTML='';
     void overlay.offsetWidth;              /* force reflow so the fade-in + resets apply */
     overlay.style.opacity='1';
     if(o.vignette){
@@ -583,9 +665,21 @@ local OVERLAY_JS = [==[
       timers.push(setTimeout(function(){
         overlay.style.transition='opacity '+(fadeOut/1000)+'s ease';
         overlay.style.opacity='0';   /* vignette already handled its own fade-out above */
-        txt.style.opacity='0'; sub.style.opacity='0';
+        txt.style.opacity='0'; sub.style.opacity='0'; inj.style.opacity='0';
       }, fadeIn+hold));
     }
+  };
+  /* injuries arrive AFTER the deform query (async), so they get their own reveal call */
+  ds.showInjuries=function(injuries, injSize, injColor){
+    if(!inj || !injuries || !injuries.length) return;
+    inj.style.fontSize=(injSize||26)+'px';
+    inj.style.color=injColor||'#e8b4b4';
+    var ih='<div style="font-size:.62em;letter-spacing:4px;opacity:.7;font-weight:700;margin-bottom:8px">INJURY REPORT</div>';
+    for(var i=0;i<injuries.length;i++){ ih+='<div>'+injuries[i]+'</div>'; }
+    inj.innerHTML=ih;
+    inj.style.transition='none'; inj.style.opacity='0';
+    void inj.offsetWidth;
+    timers.push(setTimeout(function(){ inj.style.transition='opacity .5s ease'; inj.style.opacity='.92'; }, 200));
   };
   /* release a held blackout: fade everything back out over fadeOutMs */
   ds.release=function(fadeOutMs){
@@ -670,7 +764,7 @@ local OVERLAY_JS = [==[
     if(D.raf){ cancelAnimationFrame(D.raf); D.raf=0; }
     if(toastT){ clearTimeout(toastT); toastT=0; }
     [overlay,dmgVig,toastEl,warmEl].forEach(function(el){ if(el&&el.parentNode){ el.parentNode.removeChild(el); } });
-    overlay=vig=txt=sub=dmgVig=toastEl=warmEl=null;
+    overlay=vig=txt=sub=inj=dmgVig=toastEl=warmEl=null;
     try{ delete window.__DeathScreen; }catch(e){ window.__DeathScreen=null; }
   };
 })();
@@ -729,6 +823,10 @@ local peakDamage  = 0      -- highest recentDamage seen since last reset (for tu
 local uiClock     = 0      -- ever-increasing real-time clock
 local cooldownTimer = 0    -- brief lock after a blackout so a tumbling wreck can't re-fire
 local RETRIGGER_COOLDOWN = 2.0
+-- deform-direction state in one table (keeps the file under LuaJIT's 200-locals-per-chunk cap):
+-- snapT = snapshot cadence, queryT = post-crash query countdown, speed = latest km/h (gates the
+-- snapshot), pend = { force, spd, fb } awaiting the async deform-direction result.
+local DEF = { snapT = 0.5, queryT = 0, speed = 0, pend = nil }
 
 -- damage-vignette state (the swell/fade animation itself runs in the browser)
 local frameDamageDelta = 0 -- new damage this frame (set by updateDetection)
@@ -870,9 +968,9 @@ local function triggerBlur()
     if blurActive then return end
     blurActive = true
     blurPhase  = "in"
-    blurHold   = blurDurPtr[0]
+    blurHold   = BLUR.dur[0]
     -- snap straight to full if fade-in is off (or zero-length)
-    if blurFadeInPtr[0] and blurFadeInDurPtr[0] > 0 then
+    if BLUR.fadeIn[0] and BLUR.fadeInDur[0] > 0 then
         blurLevel = 0
     else
         blurLevel = 1; blurPhase = "hold"
@@ -889,19 +987,19 @@ local function updateBlur(dt)
     end
     if not blurActive then return end
     if blurPhase == "in" then
-        blurLevel = blurLevel + dt / math.max(0.01, blurFadeInDurPtr[0])
+        blurLevel = blurLevel + dt / math.max(0.01, BLUR.fadeInDur[0])
         if blurLevel >= 1 then blurLevel = 1; blurPhase = "hold" end
     elseif blurPhase == "hold" then
         blurHold = blurHold - dt
         if blurHold <= 0 then
             blurPhase = "out"
             -- snap straight off if fade-out is disabled (or zero-length)
-            if not (blurFadeOutPtr[0] and blurFadeOutDurPtr[0] > 0) then
+            if not (BLUR.fadeOut[0] and BLUR.fadeOutDur[0] > 0) then
                 blurLevel = 0; blurActive = false
             end
         end
     else -- "out"
-        blurLevel = blurLevel - dt / math.max(0.01, blurFadeOutDurPtr[0])
+        blurLevel = blurLevel - dt / math.max(0.01, BLUR.fadeOutDur[0])
         if blurLevel <= 0 then blurLevel = 0; blurActive = false end
     end
 end
@@ -910,7 +1008,7 @@ end
 -- crash blur and the recovery blur feed this; we draw whichever is currently stronger.
 -- Intensity goes in RGB because the blend uses the mask's .r channel (see above).
 local function renderBlur()
-    local crashAmt = (blurLevel > 0)        and (blurLevel * blurAmtPtr[0])                 or 0
+    local crashAmt = (blurLevel > 0)        and (blurLevel * BLUR.amt[0])                 or 0
     local recAmt   = (recoveryBlurLevel > 0) and (recoveryBlurLevel * recoveryBlurAmtPtr[0]) or 0
     local amt = math.max(crashAmt, recAmt)
     if amt <= 0 then return end
@@ -1036,12 +1134,203 @@ local function buildMessageOpts()
     return opts
 end
 
-local function triggerDeathScreen(force, crashForce, held)
+-- Tier 2: which side of the car took the hit, from the vehicle's velocity in its own
+-- local frame at the trigger frame. Approximates impact side by direction of travel --
+-- good for the common "you drove into something" case. Falls back to "front".
+local ROLLOVER_Z = 0.35   -- up.z below this at impact = a rollover (on its side / roof)
+local function impactDirection()
+    local dir
+    pcall(function()
+        local veh = be:getPlayerVehicle(0)
+        if not veh then return end
+        local up = vec3(veh:getDirectionVectorUp())
+        if up.z < ROLLOVER_Z then dir = "rollover"; return end
+        -- delta-v = how the car got SLAMMED (approach velocity -> now). It points at the part
+        -- that actually HIT, regardless of which way you were travelling (spins, clips, slides).
+        -- approach velocity = the fastest sample in the damage window (just before the crush).
+        local curVel = vec3(veh:getVelocity())
+        local approachV, maxS = nil, -1
+        for i = 1, #dmgWindow do
+            local w = dmgWindow[i]
+            if w.v and w.s and w.s > maxS then maxS = w.s; approachV = w.v end
+        end
+        local dv = approachV and (curVel - approachV) or (curVel * -1)   -- fallback: travel dir
+        if dv:length() < 0.5 then dir = "front"; return end
+        local fwd   = vec3(veh:getDirectionVector())
+        local right = fwd:cross(up)
+        local f, r = dv:dot(fwd), dv:dot(right)   -- dv points AWAY from the impact
+        if math.abs(f) >= math.abs(r) then dir = (f <= 0) and "front" or "rear"
+        else dir = (r <= 0) and "sideRight" or "sideLeft" end   -- driver = left (LHD)
+    end)
+    return dir
+end
+
+-- Pick the injury lines. `crashForce` sets the severity tier (1..4) over the trigger
+-- threshold..full-blast range (nil Test = mid tier). `dir` picks the body region
+-- (nil = random region, for a Test). `parts` reserved for Tier 3 (real part damage).
+local function buildInjuryReport(crashForce, dir, injSpeed, cabin)
+    local tone    = INJ.funny[0] and INJ.pools.funny or INJ.pools.clinical
+    local ctxTone = INJ.funny[0] and INJ.context.funny or INJ.context.clinical
+    local region  = dir or ({ "front", "rear", "sideLeft", "sideRight", "rollover" })[math.random(5)]
+    local poolRegion = (region == "sideLeft" or region == "sideRight") and "side" or region
+    -- severity tier from crash force (over threshold..full-blast range)
+    local tier
+    if crashForce then
+        local thr  = thresholdPtr[0]
+        local full = math.max(thr + 1, scaleFullPtr[0])
+        local t = (crashForce - thr) / (full - thr)
+        if t < 0 then t = 0 elseif t > 1 then t = 1 end
+        tier = 1 + math.floor(t * 3.999)
+    else
+        tier = math.random(2, 4)
+    end
+    if tier < 1 then tier = 1 elseif tier > 4 then tier = 4 end
+    -- Speed matters, and DIRECTION changes survivability: a frontal crash (crumple zone +
+    -- airbags) is far more survivable than a side/rollover at the same speed. Per-region
+    -- speed tiers; injury tier = the harsher of the damage tier and the speed tier.
+    if injSpeed then
+        local th = INJ.sevSpeed[poolRegion] or INJ.sevSpeed.front
+        local sc = INJ.tough[0]   -- survivability: higher = need more speed to reach each tier
+        local st = (injSpeed >= th[3] * sc and 4) or (injSpeed >= th[2] * sc and 3) or (injSpeed >= th[1] * sc and 2) or 1
+        if st > tier then tier = st end
+    end
+    -- Cabin-intrusion modulation (real deformation in the SEAT band; crumple-only crashes read
+    -- 0.03-0.08 there). Front/rear have crumple zones: cabin intact = you live -- up to the speed
+    -- where the deceleration alone is lethal (~200 km/h, scaled by Survivability). Sides have NO
+    -- crumple (the rigid door transmits the hit), so no such mercy there. And crush that actually
+    -- reaches the seat is always at least serious.
+    if cabin then
+        if (poolRegion == "front" or poolRegion == "rear") and cabin < 0.12 and tier > 3
+            and (not injSpeed or injSpeed < 200 * INJ.tough[0]) then tier = 3 end
+        if cabin >= 0.22 and tier < 3 then tier = 3 end
+    end
+    local rp = tone[poolRegion] or tone.front
+    local n = math.min(tier, 3)                          -- up to 3 region injuries
+    local chosen = {}
+    local function drawFrom(src, k)                       -- k distinct random picks appended to chosen
+        local order = {}
+        for i = 1, #src do order[i] = i end
+        for i = 1, math.min(k, #src) do
+            local j = math.random(i, #src)
+            order[i], order[j] = order[j], order[i]
+            chosen[#chosen + 1] = src[order[i]]
+        end
+    end
+    local primary   = (tier >= 3) and rp.major or rp.minor
+    local secondary = (tier >= 3) and rp.minor or rp.major
+    drawFrom(primary, n)
+    if #chosen < n then drawFrom(secondary, n - #chosen) end   -- backfill if the band was short
+    if tier == 4 and INJ.showFatal[0] and tone.fatal then chosen[#chosen + 1] = tone.fatal[math.random(#tone.fatal)] end
+    local ctx = ctxTone[region] or ctxTone[poolRegion]         -- lead with the detected impact
+    if ctx and INJ.showDir[0] then table.insert(chosen, 1, ctx) end
+    return chosen
+end
+
+-- Deformation-based impact direction (Tier 3). While driving we keep a rolling pre-crash node
+-- snapshot (snapshotDeform -> VE globals _dsSnap/_dsSnapPrev, body nodes only). On a crash we
+-- freeze it and queryDeform() diffs the crushed state against it -- the baseline cancels, leaving
+-- only crash movement -> a deformation centroid. onDeformResult() turns cy (front/back) + cz
+-- (rollover) into the direction. Left/right isn't separable (car is long+narrow), so side /
+-- ambiguous hits fall back to the delta-v guess (which keeps the driver/passenger flavour).
+local function showInjuriesFor(force, dir, spd, cabin)
+    local list = buildInjuryReport(force, dir, spd, cabin)
+    if not list or #list == 0 then return end
+    local parts = {}
+    for i = 1, #list do parts[i] = jsStr(list[i]) end
+    pcall(function()
+        be:executeJS("window.__DeathScreen && window.__DeathScreen.showInjuries([" ..
+            table.concat(parts, ",") .. "]," .. math.floor(INJ.size[0] + 0.5) .. "," .. jsStr(hexOf(INJ.color)) .. ");")
+    end)
+end
+local function onDeformResult(cx, cy, cz, tot, b1, b2, b3, b4, b5)
+    if not DEF.pend then return end
+    local p = DEF.pend; DEF.pend = nil
+    local dir
+    if tot and tot > 0.5 and cy then     -- clear deformation -> trust it for front / rear / rollover
+        if cz and cz > 0.85 then dir = "rollover"
+        elseif cy < -0.35 then dir = "front"
+        elseif cy > 0.4 then
+            -- door hits masquerade as "rear": doors are rigid (impact beams), so the soft rear
+            -- quarter takes the visible crush. If the impulse was clearly LATERAL, it was a side hit.
+            if p.fb == "sideLeft" or p.fb == "sideRight" then dir = p.fb else dir = "rear" end
+        end
+    end
+    showInjuriesFor(p.force, dir or p.fb, p.spd, b3)   -- b3 = seat-band crush -> cabin-intrusion severity
+end
+local function snapshotDeform()
+    local veh = be:getPlayerVehicle(0)
+    if not veh then return end
+    pcall(function()
+        veh:queueLuaCommand([[
+            local nodes = v and v.data and v.data.nodes
+            if not nodes then return end
+            local fwd, up = obj:getDirectionVector(), obj:getDirectionVectorUp()
+            local right = fwd:cross(up)
+            _dsSnapPrev = _dsSnap
+            _dsSnap = {}
+            for _, n in pairs(nodes) do
+                if n.cid and not n.wheelID then
+                    local p = obj:getNodePosition(n.cid)
+                    _dsSnap[n.cid] = { p:dot(right), p:dot(fwd), p:dot(up) }
+                end
+            end
+        ]])
+    end)
+end
+local function queryDeform()
+    local veh = be:getPlayerVehicle(0)
+    if not veh then onDeformResult(0, 0, 0, 0); return end
+    pcall(function()
+        veh:queueLuaCommand([[
+            local snap = _dsSnapPrev or _dsSnap
+            local nodes = v and v.data and v.data.nodes
+            if not snap or not nodes then
+                obj:queueGameEngineLua('if extensions.DeathScreen and extensions.DeathScreen.onDeformResult then extensions.DeathScreen.onDeformResult(0,0,0,0) end'); return
+            end
+            local fwd, up = obj:getDirectionVector(), obj:getDirectionVectorUp()
+            local right = fwd:cross(up)
+            -- longitudinal extent from rest positions (front = most-negative y per our probes)
+            local minY, maxY = 1e9, -1e9
+            for _, n in pairs(nodes) do
+                if n.pos and n.cid and not n.wheelID then
+                    if n.pos.y < minY then minY = n.pos.y end
+                    if n.pos.y > maxY then maxY = n.pos.y end
+                end
+            end
+            local len = maxY - minY
+            if len < 0.01 then len = 0.01 end
+            local cx, cy, cz, tot = 0, 0, 0, 0
+            local b1, b2, b3, b4, b5 = 0, 0, 0, 0, 0   -- deformation by fifth of the car, nose->tail
+            for _, n in pairs(nodes) do
+                if n.cid and n.pos and not n.wheelID and snap[n.cid] then
+                    local p = obj:getNodePosition(n.cid)
+                    local s = snap[n.cid]
+                    local dx, dy, dz = p:dot(right) - s[1], p:dot(fwd) - s[2], p:dot(up) - s[3]
+                    local mag = math.sqrt(dx * dx + dy * dy + dz * dz)
+                    cx, cy, cz, tot = cx + n.pos.x * mag, cy + n.pos.y * mag, cz + n.pos.z * mag, tot + mag
+                    local bi = math.floor(((n.pos.y - minY) / len) * 5) + 1
+                    if bi < 1 then bi = 1 elseif bi > 5 then bi = 5 end
+                    if bi == 1 then b1 = b1 + mag elseif bi == 2 then b2 = b2 + mag
+                    elseif bi == 3 then b3 = b3 + mag elseif bi == 4 then b4 = b4 + mag
+                    else b5 = b5 + mag end
+                end
+            end
+            if tot < 0.001 then
+                obj:queueGameEngineLua('if extensions.DeathScreen and extensions.DeathScreen.onDeformResult then extensions.DeathScreen.onDeformResult(0,0,0,0) end')
+            else
+                obj:queueGameEngineLua(string.format('if extensions.DeathScreen and extensions.DeathScreen.onDeformResult then extensions.DeathScreen.onDeformResult(%.3f,%.3f,%.3f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f) end',
+                    cx / tot, cy / tot, cz / tot, tot, b1 / tot, b2 / tot, b3 / tot, b4 / tot, b5 / tot))
+            end
+        ]])
+    end)
+end
+
+local function triggerDeathScreen(force, crashForce, held, injSpeed)
     if isShowing then return end
     -- crash blackout is gated by 'Enable blackout'; a pass-out (held) is its own trigger
     -- and only needs the global 'Enabled', so it works even with the blackout turned off
     if not force and not enabledPtr[0] then return end
-    if not force and not held and not blackoutPtr[0] then return end
+    if not force and not held and not (blackoutPtr[0] or showTextPtr[0] or INJ.on[0]) then return end   -- need black, message, or injury to show
 
     installUI()
     if not uiInstalled then return end
@@ -1051,8 +1340,8 @@ local function triggerDeathScreen(force, crashForce, held)
     -- "Full-blast force" (and above) -> the full "Blackout length" + "Darkness".
     -- A manual test uses the full one.
     local holdSec = durationPtr[0]
-    local darkVal = opacityPtr[0]
-    if scalePtr[0] and crashForce then
+    local darkVal = blackoutPtr[0] and opacityPtr[0] or 0   -- no blackout = transparent; message/injury still show over gameplay
+    if blackoutPtr[0] and scalePtr[0] and crashForce then
         local thr  = thresholdPtr[0]
         local full = math.max(thr + 1, scaleFullPtr[0])
         local t = (crashForce - thr) / (full - thr)
@@ -1117,6 +1406,18 @@ local function triggerDeathScreen(force, crashForce, held)
     if soundEv ~= "" then playDeathSound(soundEv, soundVol) end
     if SM.on[0] and not held then triggerSlowmo(crashForce) end   -- no indefinite slow-mo for a held passout
     armRecoveryBlur()   -- fires when the black starts lifting (handled in onUpdate / on release)
+    -- Injury report: on a real crash, query deformation for the direction then show it async
+    -- (onDeformResult); a manual Test has no crash, so show one immediately with a random region.
+    if INJ.on[0] and not held then
+        if crashForce and INJ.deform[0] then
+            DEF.pend = { force = crashForce, spd = injSpeed, fb = impactDirection() }
+            DEF.queryT = 0.5
+        elseif crashForce then
+            showInjuriesFor(crashForce, impactDirection(), injSpeed)   -- impulse-only mode (deform detection off)
+        else
+            showInjuriesFor(nil, nil, injSpeed)
+        end
+    end
     -- clear the window so the same crash can't re-trigger the instant the cooldown ends
     dmgWindow = {}
     recentDamage = 0
@@ -1212,10 +1513,11 @@ local function updateDetection(dtReal)
     end
 
     local speed = (mo.vel and mo.vel:length() * 3.6) or 0
+    DEF.speed = speed
 
     if delta > 0 then
         frameDamageDelta = delta     -- feed the damage vignette
-        dmgWindow[#dmgWindow + 1] = { t = uiClock, d = delta, s = speed }
+        dmgWindow[#dmgWindow + 1] = { t = uiClock, d = delta, s = speed, v = mo.vel and vec3(mo.vel) or nil }
         recentDamage = recentDamage + delta
     end
 
@@ -1235,7 +1537,7 @@ local function updateDetection(dtReal)
     -- ordinary crashes -- not just death-screen-level ones. Works with the blackout
     -- off (but still respects the global master); triggerBlur() self-guards so a
     -- sustained crash won't re-fire it.
-    if enabledPtr[0] and blurPtr[0] and recentDamage >= blurTrigPtr[0] then
+    if enabledPtr[0] and BLUR.on[0] and recentDamage >= BLUR.trig[0] then
         triggerBlur()
     end
 
@@ -1249,10 +1551,10 @@ local function updateDetection(dtReal)
             if dmgWindow[i].s and dmgWindow[i].s > impactSpeed then impactSpeed = dmgWindow[i].s end
         end
         if impactSpeed >= minSpeedPtr[0] and enabledPtr[0] and cooldownTimer <= 0 then
-            if blackoutPtr[0] then                       -- full death screen (slow-mo included)
+            if blackoutPtr[0] or showTextPtr[0] or INJ.on[0] then   -- black screen, OR just the message/injury over gameplay
                 lastReason = string.format("%.0f dmg @ %d km/h", recentDamage, math.floor(impactSpeed + 0.5))
-                triggerDeathScreen(false, recentDamage)
-            elseif SM.on[0] then                         -- blackout off, slow-mo on: bullet-time alone
+                triggerDeathScreen(false, recentDamage, nil, impactSpeed)
+            elseif SM.on[0] then                         -- no overlay content, only slow-mo: bullet-time alone
                 lastReason = string.format("slow-mo: %.0f dmg @ %d km/h", recentDamage, math.floor(impactSpeed + 0.5))
                 triggerSlowmoOnly(recentDamage)
             end
@@ -1400,26 +1702,26 @@ local function drawEffects()
             end
         end
 
-        if checkbox("Crash blur", blurPtr,
+        if checkbox("Crash blur", BLUR.on,
             "Blurs the whole screen for a moment on a crash, like being dazed. Uses the game's own full-screen blur. Turn off the death screen to see it clearly, or use the Test button.") then dirty = true end
-        if blurPtr[0] then
-            if slider("blura", "Blur strength", blurAmtPtr, 0.05, 1.0, "%.2f",
+        if BLUR.on[0] then
+            if slider("blura", "Blur strength", BLUR.amt, 0.05, 1.0, "%.2f",
                 "How blurry it gets. Lower = subtler, 1.0 = full menu-grade blur.") then dirty = true end
-            if slider("blurd", "Blur length", blurDurPtr, 0.1, 8.0, "%.1f s",
+            if slider("blurd", "Blur length", BLUR.dur, 0.1, 8.0, "%.1f s",
                 "How long the blur holds at full before easing off (not counting the fades).") then dirty = true end
-            if checkbox("Fade in##blur", blurFadeInPtr,
+            if checkbox("Fade in##blur", BLUR.fadeIn,
                 "Ease the blur in. Off = it snaps on instantly.") then dirty = true end
-            if blurFadeInPtr[0] then
-                if slider("blurfin", "Fade in time", blurFadeInDurPtr, 0.0, 5.0, "%.1f s",
+            if BLUR.fadeIn[0] then
+                if slider("blurfin", "Fade in time", BLUR.fadeInDur, 0.0, 5.0, "%.1f s",
                     "How long the blur takes to ramp in.") then dirty = true end
             end
-            if checkbox("Fade out##blur", blurFadeOutPtr,
+            if checkbox("Fade out##blur", BLUR.fadeOut,
                 "Ease the blur out. Off = it snaps off instantly.") then dirty = true end
-            if blurFadeOutPtr[0] then
-                if slider("blurfout", "Fade out time", blurFadeOutDurPtr, 0.0, 5.0, "%.1f s",
+            if BLUR.fadeOut[0] then
+                if slider("blurfout", "Fade out time", BLUR.fadeOutDur, 0.0, 5.0, "%.1f s",
                     "How long the blur takes to ramp out after the hold.") then dirty = true end
             end
-            if slider("blurt", "Trigger at damage", blurTrigPtr, 1000.0, 300000.0, "%.0f",
+            if slider("blurt", "Trigger at damage", BLUR.trig, 1000.0, 300000.0, "%.0f",
                 "Crash force that sets the blur off. Lower = even small bumps blur. Watch 'Biggest so far' in the trigger section to pick a value. (Its own threshold, separate from the death screen.)") then dirty = true end
             if im.Button("Test blur") then triggerBlur() end
         end
@@ -1509,6 +1811,38 @@ local function drawEffects()
                 "Crash force that flashes it to full strength. Lower = even small hits flash strongly. (Uses the same 'crash force' as the readout above.)") then dirty = true end
             if slider("dvfade", "Fade time", dmgVigFadePtr, 0.2, 5.0, "%.1f s",
                 "How long the flash takes to fade away after a hit.") then dirty = true end
+        end
+    end
+    return dirty
+end
+
+-- Injury report section (own fn: keeps drawSettingsWindow under the 60-upvalue cap).
+local function drawInjury()
+    local dirty = false
+    if section("Injury report", false) then
+        im.TextColored(im.ImVec4(0.95, 0.75, 0.35, 1.0), "Experimental")
+        helpMarker("Injuries are estimated from the car's real crash deformation and impact physics. Most crashes read right, but odd multi-hit or corner crashes can misread. Pure roleplay flavour - not a medical sim.")
+        if checkbox("Show injury report", INJ.on,
+            "After a crash, lists the 'injuries' you sustained - where you got hit, how hard, and whether the crush reached your seat. Pure roleplay flavour. Off by default.") then dirty = true end
+        if INJ.on[0] then
+            if checkbox("Darkly funny", INJ.funny,
+                "Tone of the report. Off = clinical (\"Fractured rib\"). On = dark humour (\"Spleen has left the chat\").") then dirty = true end
+            if checkbox("Deformation-based detection", INJ.deform,
+                "Reads the car's ACTUAL crush to tell where you got hit and whether the cabin was intruded (recommended). Tiny background cost while driving. Off = a lighter guess from the impact impulse only.") then dirty = true end
+            if checkbox("Show impact direction", INJ.showDir,
+                "Lead the report with the detected impact ('Frontal impact', 'Driver's-side impact', 'Rollover'...). Off = just the injuries.") then dirty = true end
+            if slider("injsize", "Injury text size", INJ.size, 10.0, 60.0, "%.0f px",
+                "Font size of the injury lines.") then dirty = true end
+            if im.ColorEdit3("Injury text color", INJ.color) then dirty = true end
+            im.SameLine()
+            if im.Button("Reset##injcol") then
+                INJ.color[0] = im.Float(DEFAULT_INJCOLOR[1]); INJ.color[1] = im.Float(DEFAULT_INJCOLOR[2]); INJ.color[2] = im.Float(DEFAULT_INJCOLOR[3])
+                dirty = true
+            end
+            if slider("injtough", "Survivability", INJ.tough, 0.5, 2.0, "%.2fx",
+                "How well you shrug off crashes. Higher = survive harder hits (e.g. with a roll cage), lower = fragile. 1.0 = default. Frontal crashes are always more survivable than side/rollover.") then dirty = true end
+            if checkbox("Allow fatal injuries", INJ.showFatal,
+                "On = the worst crashes can end with a 'deceased' line. Off = you always 'survive' (still lists the injuries, just no death).") then dirty = true end
         end
     end
     return dirty
@@ -1717,6 +2051,7 @@ local function drawSettingsWindow()
 
         --------------------------------------------------------------------------
         if drawMessage() then dirty = true end   -- Message section (own function: keeps upvalues under Lua's 60 limit)
+        if drawInjury() then dirty = true end    -- Injury report section (own function, same reason)
 
         --------------------------------------------------------------------------
         if drawEffects() then dirty = true end   -- Effects + Damage vignette (own function: keeps upvalues under Lua's 60 limit)
@@ -1917,6 +2252,16 @@ local function onUpdate(dtReal)
     updateFlipout(dtReal)
     updateDamageVignette(dtReal)
     updateBlur(dtReal)
+    -- keep a rolling pre-crash node snapshot while driving fast enough to crash (deform direction);
+    -- free when the injury report is off, when parked/slow, or while a death screen is up
+    if INJ.on[0] and INJ.deform[0] and not isShowing and DEF.speed > 8 then   -- low gate: slow door-hit lineups still get a snapshot
+        DEF.snapT = DEF.snapT - (dtReal or 0)
+        if DEF.snapT <= 0 then DEF.snapT = 0.5; snapshotDeform() end
+    end
+    if DEF.queryT > 0 then   -- fire the deform query ~0.5s after a crash -> onDeformResult shows the report
+        DEF.queryT = DEF.queryT - (dtReal or 0)
+        if DEF.queryT <= 0 then DEF.queryT = 0; queryDeform() end
+    end
 
     -- senses-before-vision: bring the game audio back while the screen is still black
     if soundBackTimer > 0 then
@@ -2080,6 +2425,7 @@ end
 M.onUpdate = onUpdate
 M.onPreRender = renderBlur           -- applies the full-screen crash blur each render frame
 M.onExtensionLoaded = onExtensionLoaded
+M.onDeformResult = onDeformResult   -- async deform-direction result from the vehicle
 M.onExtensionUnloaded = onExtensionUnloaded
 M.onVehicleResetted = onVehicleResetted
 M.onClientEndMission = onClientEndMission
