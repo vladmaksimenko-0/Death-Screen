@@ -46,6 +46,8 @@ The window is split into collapsible sections. Hover the **(?)** on any option f
 
 Save your whole current setup under a name, then load or switch between presets instantly - e.g. a "cinematic" set and a "subtle" set. Type a name, hit **Save**, and each saved preset gets its own **Load** and delete buttons. A preset captures every effect setting; **Reset all to defaults** leaves your saved presets untouched.
 
+**Sharing presets:** each preset is saved as its own `.json` file in `settings/DeathScreen/Presets/` (there's an **Open presets folder** button). To share one, send someone the file; to add someone else's, drop it into that folder - it appears in your list **live**, no restart needed.
+
 ### Top level
 
 | Setting | Default | What it does |
@@ -115,6 +117,8 @@ After a crash, an on-screen report lists the "injuries" you sustained. It reads 
 | Show impact direction | on | - | Lead the report with the detected impact ("Frontal impact", "Driver's-side impact"...). Off = just the injuries. |
 | Injury text size | 26 px | 10 - 60 | Font size of the report. |
 | Injury text color | pale red | - | Full color picker (with a Reset). |
+| Position | Auto | Auto / Top / Center / Bottom | Where the report sits. **Auto** puts it wherever your message isn't - the opposite end from your message position, or centered when there's no message. If any position would land on the message, the report slides just clear of it rather than overlapping (the message is never moved), so picking your message's own spot is safe - it just won't be exactly on that spot. |
+| Show after | 0.7 s | 0.3 - 6.0 | How long after the crash the report fades in. Auto-capped so the report always has time to be read before the screen clears - push it past your blackout length and it settles near the end rather than flashing by. For a genuinely longer delay, raise the **Blackout length** (that's what this is capped against). With deformation detection on, it also can't beat the ~0.5 s the game needs to read the crush first. |
 | Survivability | 1.0x | 0.5 - 2.0 | Higher = survive harder hits (roll-cage builds), lower = fragile. |
 | Allow fatal injuries | on | - | Off = you always "survive" - injuries still listed, just no death line. |
 

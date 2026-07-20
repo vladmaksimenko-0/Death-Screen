@@ -26,6 +26,7 @@ local ffi = require('ffi')
 --------------------------------------------------------------------------------
 local SETTINGS_PATH = "settings/DeathScreen/settings.json"
 local SOUND_DIR     = "/settings/DeathScreen/"   -- bare filenames resolve here
+local PRESETS_DIR   = "/settings/DeathScreen/Presets/"   -- one .json per preset (shareable: drop a file in)
 local TEXT_CAP = 48
 local SUB_CAP  = 64
 local PRESET_CAP = 48
@@ -107,13 +108,16 @@ local tintArr         = im.ArrayFloat(3)  -- vignette edge color (RGB 0..1)
 -- Damage vignette: FPS-style. ANY crash (not just death-screen ones) flashes a
 -- colored vignette at the screen edges whose strength scales with the hit, then
 -- fades away on its own. Independent of the blackout.
-local dmgVigPtr       = im.BoolPtr(true)
-local dmgVigMaxPtr    = im.FloatPtr(0.7)   -- peak opacity of the flash (0..1)
-local dmgVigCoverPtr  = im.FloatPtr(0.7)   -- how far it reaches in from the edges at full strength (0..1)
-local dmgVigSoftPtr   = im.FloatPtr(0.6)   -- gradient softness: how wide/feathered the edge fade is (0..1)
-local dmgVigFullPtr   = im.FloatPtr(40000) -- damage that pushes it to full strength
-local dmgVigFadePtr   = im.FloatPtr(1.5)   -- seconds to fade back to nothing
-local dmgVigColorArr  = im.ArrayFloat(3)   -- edge color (RGB 0..1)
+-- Damage-vignette settings grouped in a table (keeps the file under LuaJIT's 200-locals cap)
+local DVIG = {
+    on    = im.BoolPtr(true),
+    max   = im.FloatPtr(0.7),    -- peak opacity of the flash (0..1)
+    cover = im.FloatPtr(0.7),    -- how far it reaches in from the edges at full strength (0..1)
+    soft  = im.FloatPtr(0.6),    -- gradient softness: how wide/feathered the edge fade is (0..1)
+    full  = im.FloatPtr(40000),  -- damage that pushes it to full strength
+    fade  = im.FloatPtr(1.5),    -- seconds to fade back to nothing
+    color = im.ArrayFloat(3),    -- edge color (RGB 0..1)
+}
 
 -- Crash blur: a full-screen gaussian blur on crash (the game's menu-background blur).
 -- Crash-blur settings grouped in a table (LuaJIT 200-locals-per-chunk cap; same as SM/PASSOUT/INJ)
@@ -181,6 +185,8 @@ local INJ = {
     deform = im.BoolPtr(true),   -- deformation-based detection (reads the real crush; off = impulse-only guess)
     color  = im.ArrayFloat(3),   -- injury text color (defaults set below)
     showDir = im.BoolPtr(true),  -- lead the report with the detected impact ("Frontal impact" etc.)
+    delay   = im.FloatPtr(0.7),  -- seconds after the crash before the report fades in (auto-capped below the blackout)
+    pos     = im.IntPtr(0),      -- 0 auto (bottom w/ message, centred without) / 1 top / 2 centre / 3 bottom
     -- pools[tone][region] = {minor=, major=} by impact direction; plus a per-tone `fatal`
     -- capstone for the worst crashes. Nested in INJ so it isn't a separate top-level local.
     pools = {
@@ -235,9 +241,9 @@ setBuf(soundEventBuf, EVENT_CAP, "")   -- empty by default; user picks their own
 tintArr[0] = im.Float(DEFAULT_TINT[1])   -- dark-red vignette edges
 tintArr[1] = im.Float(DEFAULT_TINT[2])
 tintArr[2] = im.Float(DEFAULT_TINT[3])
-dmgVigColorArr[0] = im.Float(DEFAULT_DMGCOLOR[1])
-dmgVigColorArr[1] = im.Float(DEFAULT_DMGCOLOR[2])
-dmgVigColorArr[2] = im.Float(DEFAULT_DMGCOLOR[3])
+DVIG.color[0] = im.Float(DEFAULT_DMGCOLOR[1])
+DVIG.color[1] = im.Float(DEFAULT_DMGCOLOR[2])
+DVIG.color[2] = im.Float(DEFAULT_DMGCOLOR[3])
 for i = 0, 2 do subColorArr[i]        = im.Float(DEFAULT_SUBCOLOR[i + 1]) end
 for i = 0, 2 do INJ.color[i]          = im.Float(DEFAULT_INJCOLOR[i + 1]) end
 for i = 0, 2 do textShadowColorArr[i] = im.Float(DEFAULT_SHADOW[i + 1]) end
@@ -245,9 +251,31 @@ for i = 0, 2 do textShadowColorArr[i] = im.Float(DEFAULT_SHADOW[i + 1]) end
 -- which collapsible sections are expanded, remembered across restarts. Keyed by
 -- the section label; `section()` fills in defaults on first run and flips
 -- sectionDirty when the user opens/closes one so we persist it.
--- named presets: name -> a full settings snapshot (effect settings only). Persisted in
--- settings.json under `presets`; the user can save/load/switch between them.
+-- named presets: name -> a full settings snapshot (effect settings only). Each is now one
+-- .json file in the Presets/ folder (shareable: hand someone a file / drop one in). `presets`
+-- is the in-memory list, rebuilt from disk by refreshPresets().
 local presets = {}
+local presetPollT = 0   -- live-refresh countdown while the settings window is open
+local function presetPath(name)
+    local safe = tostring(name or ""):gsub('[\\/:*?"<>|]', "_"):match("^%s*(.-)%s*$")
+    return PRESETS_DIR .. safe .. ".json"
+end
+local function ensurePresetDir()
+    pcall(function() if FS and not FS:directoryExists(PRESETS_DIR) then FS:directoryCreate(PRESETS_DIR, true) end end)
+end
+local function refreshPresets()   -- rebuild the list from the folder (filename = preset name)
+    local found = {}
+    pcall(function()
+        if not FS or not FS:directoryExists(PRESETS_DIR) then return end
+        local files = FS:findFiles(PRESETS_DIR, "*.json", 0, false, true) or {}
+        for _, path in ipairs(files) do
+            local base = tostring(path):match("([^/\\]+)%.json$")
+            local data = base and jsonReadFile(path)
+            if base and type(data) == "table" then found[base] = data end
+        end
+    end)
+    presets = found
+end
 local sectionOpen = {}
 local sectionDirty = false
 
@@ -268,13 +296,13 @@ local function saveSettings2(t)
     t.vigFadeOut    = vigFadeOutPtr[0]
     t.vigFadeOutDur = vigFadeOutDurPtr[0]
     t.tint          = { tonumber(tintArr[0]), tonumber(tintArr[1]), tonumber(tintArr[2]) }
-    t.dmgVig        = dmgVigPtr[0]
-    t.dmgVigMax     = dmgVigMaxPtr[0]
-    t.dmgVigCover   = dmgVigCoverPtr[0]
-    t.dmgVigSoft    = dmgVigSoftPtr[0]
-    t.dmgVigFull    = dmgVigFullPtr[0]
-    t.dmgVigFade    = dmgVigFadePtr[0]
-    t.dmgVigColor   = { tonumber(dmgVigColorArr[0]), tonumber(dmgVigColorArr[1]), tonumber(dmgVigColorArr[2]) }
+    t.dmgVig        = DVIG.on[0]
+    t.dmgVigMax     = DVIG.max[0]
+    t.dmgVigCover   = DVIG.cover[0]
+    t.dmgVigSoft    = DVIG.soft[0]
+    t.dmgVigFull    = DVIG.full[0]
+    t.dmgVigFade    = DVIG.fade[0]
+    t.dmgVigColor   = { tonumber(DVIG.color[0]), tonumber(DVIG.color[1]), tonumber(DVIG.color[2]) }
     t.blur          = BLUR.on[0]
     t.blurAmt       = BLUR.amt[0]
     t.blurDur       = BLUR.dur[0]
@@ -299,7 +327,6 @@ local function saveSettings2(t)
     t.windowOpen    = windowOpen[0]
     t.hideUI        = hideUIPtr[0]
     t.noticeSeen    = noticeSeen
-    t.presets       = presets
 end
 
 local function buildSettings()
@@ -324,6 +351,8 @@ local function buildSettings()
             injFatal    = INJ.showFatal[0],
             injDeform   = INJ.deform[0],
             injShowDir  = INJ.showDir[0],
+            injDelay    = INJ.delay[0],
+            injPos      = INJ.pos[0],
             injColor    = { tonumber(INJ.color[0]), tonumber(INJ.color[1]), tonumber(INJ.color[2]) },
             opacity     = opacityPtr[0],
             scale       = scalePtr[0],
@@ -390,16 +419,16 @@ local function loadSettings2(s)
             tintArr[i] = im.Float(math.max(0.0, math.min(1.0, v)))
         end
     end
-    if s.dmgVig     ~= nil then dmgVigPtr[0]     = (s.dmgVig == true) end
-    if s.dmgVigMax  ~= nil then dmgVigMaxPtr[0]  = math.max(0.1, math.min(1.0, tonumber(s.dmgVigMax) or 0.7)) end
-    if s.dmgVigCover~= nil then dmgVigCoverPtr[0]= math.max(0.0, math.min(1.0, tonumber(s.dmgVigCover) or 0.7)) end
-    if s.dmgVigSoft ~= nil then dmgVigSoftPtr[0] = math.max(0.0, math.min(1.0, tonumber(s.dmgVigSoft) or 0.6)) end
-    if s.dmgVigFull ~= nil then dmgVigFullPtr[0] = math.max(1000.0, math.min(300000.0, tonumber(s.dmgVigFull) or 40000)) end
-    if s.dmgVigFade ~= nil then dmgVigFadePtr[0] = math.max(0.2, math.min(5.0, tonumber(s.dmgVigFade) or 1.5)) end
+    if s.dmgVig     ~= nil then DVIG.on[0]     = (s.dmgVig == true) end
+    if s.dmgVigMax  ~= nil then DVIG.max[0]  = math.max(0.1, math.min(1.0, tonumber(s.dmgVigMax) or 0.7)) end
+    if s.dmgVigCover~= nil then DVIG.cover[0]= math.max(0.0, math.min(1.0, tonumber(s.dmgVigCover) or 0.7)) end
+    if s.dmgVigSoft ~= nil then DVIG.soft[0] = math.max(0.0, math.min(1.0, tonumber(s.dmgVigSoft) or 0.6)) end
+    if s.dmgVigFull ~= nil then DVIG.full[0] = math.max(1000.0, math.min(300000.0, tonumber(s.dmgVigFull) or 40000)) end
+    if s.dmgVigFade ~= nil then DVIG.fade[0] = math.max(0.2, math.min(5.0, tonumber(s.dmgVigFade) or 1.5)) end
     if type(s.dmgVigColor) == "table" and #s.dmgVigColor >= 3 then
         for i = 0, 2 do
             local v = tonumber(s.dmgVigColor[i + 1]) or 0
-            dmgVigColorArr[i] = im.Float(math.max(0.0, math.min(1.0, v)))
+            DVIG.color[i] = im.Float(math.max(0.0, math.min(1.0, v)))
         end
     end
     if s.blur     ~= nil then BLUR.on[0]     = (s.blur == true) end
@@ -430,7 +459,18 @@ local function loadSettings2(s)
     if s.windowOpen ~= nil then windowOpen[0]  = (s.windowOpen == true) end
     if s.hideUI     ~= nil then hideUIPtr[0]   = (s.hideUI == true) end
     if s.noticeSeen ~= nil then noticeSeen     = (s.noticeSeen == true) end
-    if type(s.presets) == "table" then presets = s.presets end
+    -- one-time migration: presets used to live in settings.json; move each to its own file
+    -- in Presets/, then re-save settings.json (buildSettings no longer includes them, so the
+    -- old `presets` key is dropped). Guarded on fileExists so it never clobbers a newer file.
+    if type(s.presets) == "table" and next(s.presets) then
+        ensurePresetDir()
+        for name, data in pairs(s.presets) do
+            if type(name) == "string" and type(data) == "table" then
+                pcall(function() if not (FS and FS:fileExists(presetPath(name))) then jsonWriteFile(presetPath(name), data, true) end end)
+            end
+        end
+        pcall(function() jsonWriteFile(SETTINGS_PATH, buildSettings(), true) end)
+    end
 end
 
 -- Loads settings from `sIn` if given (used by Reset-to-defaults), else from disk.
@@ -458,6 +498,8 @@ local function loadSettings(sIn)
         if s.injFatal     ~= nil then INJ.showFatal[0] = (s.injFatal == true) end
         if s.injDeform    ~= nil then INJ.deform[0] = (s.injDeform == true) end
         if s.injShowDir   ~= nil then INJ.showDir[0] = (s.injShowDir == true) end
+        if s.injDelay     ~= nil then INJ.delay[0] = math.max(0.3, math.min(6.0, tonumber(s.injDelay) or 0.7)) end
+        if s.injPos       ~= nil then INJ.pos[0]   = math.max(0, math.min(3, math.floor(tonumber(s.injPos) or 0))) end
         if type(s.injColor) == "table" and #s.injColor >= 3 then
             for i = 0, 2 do INJ.color[i] = im.Float(math.max(0.0, math.min(1.0, tonumber(s.injColor[i + 1]) or 0))) end
         end
@@ -519,18 +561,21 @@ local function capturePreset()
     return t
 end
 local function savePreset(name)
-    if not name or name == "" then return end
-    presets[name] = capturePreset()
-    saveSettings()
+    name = name and tostring(name):match("^%s*(.-)%s*$") or ""
+    if name == "" then return end
+    ensurePresetDir()
+    pcall(function() jsonWriteFile(presetPath(name), capturePreset(), true) end)
+    refreshPresets()
 end
 local function loadPreset(name)
     local p = presets[name]
     if type(p) ~= "table" then return end
-    loadSettings(p)     -- applies the preset's effect settings; leaves presets/window/etc. alone
+    loadSettings(p)     -- applies the preset's effect settings; leaves window/etc. alone
     saveSettings()
 end
 local function deletePreset(name)
-    if presets[name] ~= nil then presets[name] = nil; saveSettings() end
+    pcall(function() if FS then FS:removeFile(presetPath(name)) end end)
+    refreshPresets()
 end
 
 --------------------------------------------------------------------------------
@@ -571,10 +616,12 @@ local OVERLAY_JS = [==[
     sub.style.cssText='color:#dfe3e6;font-size:24px;font-weight:600;margin-top:12px;'
       +'opacity:0;transition:opacity .45s ease;text-align:center;position:relative;';
     inj=document.createElement('div'); inj.id='dsInj';
-    /* subtle dark card behind the report -- ~invisible on the black screen, but keeps the
-       text readable when there's no blackout and it floats over live gameplay */
-    inj.style.cssText='color:#e8b4b4;font-size:26px;font-weight:600;margin-top:22px;line-height:1.55;'
-      +'opacity:0;transition:opacity .5s ease;text-align:center;position:relative;'
+    /* Anchored at the bottom and OUT of the message's flex flow (position:absolute), so the
+       centered message NEVER shifts when the (async) injury report fades in a beat later.
+       Subtle dark card keeps it readable when it floats over live gameplay (no blackout). */
+    inj.style.cssText='position:absolute;left:50%;bottom:7vh;transform:translateX(-50%);max-width:90vw;'
+      +'color:#e8b4b4;font-size:26px;font-weight:600;line-height:1.55;text-align:center;'
+      +'opacity:0;transition:opacity .5s ease;'
       +'background:rgba(8,0,0,.55);padding:14px 30px;border-radius:12px;'
       +'border:1px solid rgba(255,110,110,.14);box-shadow:0 8px 40px rgba(0,0,0,.5);';
     overlay.appendChild(vig); overlay.appendChild(txt); overlay.appendChild(sub); overlay.appendChild(inj);
@@ -633,8 +680,25 @@ local OVERLAY_JS = [==[
     txt.style.transition='none'; sub.style.transition='none';
     txt.style.opacity='0'; sub.style.opacity='0';
     txt.style.transform='none'; sub.style.transform='none';   /* no scale/slide = no resize/move; clean fade only */
-    /* injury report is populated ASYNC (after the deform query) via ds.showInjuries; prime hidden */
+    /* injury report is populated ASYNC (after the deform query) via ds.showInjuries; prime hidden.
+       With a message: anchor it at the bottom (out of the message's way, so it can't shift it).
+       Without a message: it's the only thing on screen, so centre it. */
     inj.style.transition='none'; inj.style.opacity='0'; inj.innerHTML='';
+    /* injury report position: 0 auto, 1 top, 2 centre, 3 bottom.
+       AUTO = put it wherever the MESSAGE isn't, resolved to a concrete spot below.
+       No message -> centre it (it's the only thing on screen). Message at the bottom
+       -> go to the TOP: the old rule always used bottom:7vh, which sits directly under
+       a bottom-anchored message (12vh) and grows upward into it = guaranteed overlap.
+       Message at top/centre -> the bottom is clear. Never MOVES the message (the report
+       is position:absolute, out of the flex flow) so it can't shift it like it used to. */
+    var ip=(o.injPos==null?0:o.injPos);
+    if(ip===0){
+      if(!(o.text||o.sub)) ip=2;
+      else ip=((o.pos==null?1:o.pos)===2)?1:3;
+    }
+    if(ip===1){ inj.style.top='9vh'; inj.style.bottom=''; inj.style.transform='translateX(-50%)'; }
+    else if(ip===2){ inj.style.top='50%'; inj.style.bottom=''; inj.style.transform='translate(-50%,-50%)'; }
+    else { inj.style.top=''; inj.style.bottom='7vh'; inj.style.transform='translateX(-50%)'; }
     void overlay.offsetWidth;              /* force reflow so the fade-in + resets apply */
     overlay.style.opacity='1';
     if(o.vignette){
@@ -670,7 +734,7 @@ local OVERLAY_JS = [==[
     }
   };
   /* injuries arrive AFTER the deform query (async), so they get their own reveal call */
-  ds.showInjuries=function(injuries, injSize, injColor){
+  ds.showInjuries=function(injuries, injSize, injColor, revealMs){
     if(!inj || !injuries || !injuries.length) return;
     inj.style.fontSize=(injSize||26)+'px';
     inj.style.color=injColor||'#e8b4b4';
@@ -679,7 +743,34 @@ local OVERLAY_JS = [==[
     inj.innerHTML=ih;
     inj.style.transition='none'; inj.style.opacity='0';
     void inj.offsetWidth;
-    timers.push(setTimeout(function(){ inj.style.transition='opacity .5s ease'; inj.style.opacity='.92'; }, 200));
+    /* Collision nudge. Measured HERE because this is the first moment the report's real
+       height is known (content is in, layout is settled, opacity 0 doesn't affect layout).
+       If the report would land on the message, slide it clear -- down if there's room,
+       otherwise up. Only the REPORT moves: it's position:absolute and out of the flex
+       flow, so the message can never be shifted by this (that was the 1.0.2 bug).
+       Runs for every placement, not just the fixed ones, so even Auto stays clear when a
+       huge message font makes the text taller than its lane. try/catch = worst case we
+       simply keep the placement we already had. */
+    try{
+      var mTop=null, mBot=null;
+      [txt,sub].forEach(function(el){
+        if(!el || !el.textContent) return;
+        var r=el.getBoundingClientRect();
+        if(!r.height) return;
+        mTop=(mTop===null)?r.top:Math.min(mTop,r.top);
+        mBot=(mBot===null)?r.bottom:Math.max(mBot,r.bottom);
+      });
+      if(mTop!==null){
+        var ir=inj.getBoundingClientRect(), gap=28, vh=window.innerHeight;
+        if(ir.top < mBot+gap && ir.bottom+gap > mTop){          /* they collide */
+          var below=mBot+gap;
+          var y=(below+ir.height<=vh-16) ? below                /* prefer just under it */
+                                         : Math.max(16, mTop-gap-ir.height);  /* else above */
+          inj.style.top=y+'px'; inj.style.bottom=''; inj.style.transform='translateX(-50%)';
+        }
+      }
+    }catch(e){}
+    timers.push(setTimeout(function(){ inj.style.transition='opacity .5s ease'; inj.style.opacity='.92'; }, (revealMs==null?200:revealMs)));
   };
   /* release a held blackout: fade everything back out over fadeOutMs */
   ds.release=function(fadeOutMs){
@@ -826,7 +917,7 @@ local RETRIGGER_COOLDOWN = 2.0
 -- deform-direction state in one table (keeps the file under LuaJIT's 200-locals-per-chunk cap):
 -- snapT = snapshot cadence, queryT = post-crash query countdown, speed = latest km/h (gates the
 -- snapshot), pend = { force, spd, fb } awaiting the async deform-direction result.
-local DEF = { snapT = 0.5, queryT = 0, speed = 0, pend = nil }
+local DEF = { snapT = 0.5, queryT = 0, speed = 0, pend = nil, blackMs = 0 }
 
 -- damage-vignette state (the swell/fade animation itself runs in the browser)
 local frameDamageDelta = 0 -- new damage this frame (set by updateDetection)
@@ -1232,14 +1323,31 @@ end
 -- only crash movement -> a deformation centroid. onDeformResult() turns cy (front/back) + cz
 -- (rollover) into the direction. Left/right isn't separable (car is long+narrow), so side /
 -- ambiguous hits fall back to the delta-v guess (which keeps the driver/passenger flavour).
-local function showInjuriesFor(force, dir, spd, cabin)
+local function showInjuriesFor(force, dir, spd, cabin, elapsedMs)
     local list = buildInjuryReport(force, dir, spd, cabin)
     if not list or #list == 0 then return end
     local parts = {}
     for i = 1, #list do parts[i] = jsStr(list[i]) end
+    -- Absolute delay measured from the crash, capped to land INSIDE the death screen's real
+    -- on-screen window (DEF.blackMs = fadeIn+hold, already crash-force-scaled). This applies
+    -- with the blackout off too: the overlay is merely transparent then, and it still tears
+    -- itself (and the report) down at fadeIn+hold -- so an uncapped delay would reveal the
+    -- report into an already-hidden overlay and nobody would ever see it.
+    -- elapsedMs = time already spent before this call (the deform read).
+    local totalMs = math.floor(INJ.delay[0] * 1000 + 0.5)
+    if DEF.blackMs > 0 then
+        -- Reserve a READABLE window at the end, not just a sliver: the report has its own
+        -- 0.5s fade-in, so a small margin meant it was still fading in when the overlay tore
+        -- it down (it flashed and vanished). 500ms fade-in + ~1s to actually read it.
+        local capMs = DEF.blackMs - 1500
+        if capMs < 0 then capMs = 0 end
+        if totalMs > capMs then totalMs = capMs end
+    end
+    local revealMs = totalMs - (elapsedMs or 0)
+    if revealMs < 0 then revealMs = 0 end
     pcall(function()
         be:executeJS("window.__DeathScreen && window.__DeathScreen.showInjuries([" ..
-            table.concat(parts, ",") .. "]," .. math.floor(INJ.size[0] + 0.5) .. "," .. jsStr(hexOf(INJ.color)) .. ");")
+            table.concat(parts, ",") .. "]," .. math.floor(INJ.size[0] + 0.5) .. "," .. jsStr(hexOf(INJ.color)) .. "," .. revealMs .. ");")
     end)
 end
 local function onDeformResult(cx, cy, cz, tot, b1, b2, b3, b4, b5)
@@ -1255,7 +1363,7 @@ local function onDeformResult(cx, cy, cz, tot, b1, b2, b3, b4, b5)
             if p.fb == "sideLeft" or p.fb == "sideRight" then dir = p.fb else dir = "rear" end
         end
     end
-    showInjuriesFor(p.force, dir or p.fb, p.spd, b3)   -- b3 = seat-band crush -> cabin-intrusion severity
+    showInjuriesFor(p.force, dir or p.fb, p.spd, b3, 500)   -- b3 = seat-band crush -> cabin-intrusion severity; 500ms = the deform-read delay already spent
 end
 local function snapshotDeform()
     local veh = be:getPlayerVehicle(0)
@@ -1357,6 +1465,11 @@ local function triggerDeathScreen(force, crashForce, held, injSpeed)
     local fadeInMs  = math.floor((held and PASSOUT.fadeIn[0] or fadeInPtr[0]) * 1000 + 0.5)
     local holdMs    = math.floor(holdSec * 1000 + 0.5)
     local fadeOutMs = math.floor(fadeOutPtr[0] * 1000 + 0.5)
+    -- The overlay (and with it the injury report) is torn down at fadeIn+hold whether or not
+    -- the blackout is on -- "blackout off" only makes it transparent, it still hosts the text.
+    -- Stash the REAL visible window so the injury delay can be capped inside it (holdSec is
+    -- already crash-force-scaled here, so this follows a shortened blackout too).
+    DEF.blackMs = fadeInMs + holdMs
 
     local opts = "{fadeInMs:" .. fadeInMs
         .. ",holdMs:" .. holdMs
@@ -1369,6 +1482,7 @@ local function triggerDeathScreen(force, crashForce, held, injSpeed)
         opts = opts .. ",vigFadeOutMs:" .. (vigFadeOutPtr[0] and math.floor(vigFadeOutDurPtr[0] * 1000 + 0.5) or 0)
     end
     if held then opts = opts .. ",hold:true" end   -- passout: hold the black until released
+    if INJ.on[0] then opts = opts .. ",injPos:" .. INJ.pos[0] end   -- injury report position (0 auto)
     opts = opts .. buildMessageOpts()   -- message text/style opts (own fn: keeps triggerDeathScreen under the 60-upvalue cap)
     opts = opts .. "}"
 
@@ -1413,9 +1527,9 @@ local function triggerDeathScreen(force, crashForce, held, injSpeed)
             DEF.pend = { force = crashForce, spd = injSpeed, fb = impactDirection() }
             DEF.queryT = 0.5
         elseif crashForce then
-            showInjuriesFor(crashForce, impactDirection(), injSpeed)   -- impulse-only mode (deform detection off)
+            showInjuriesFor(crashForce, impactDirection(), injSpeed, 0)   -- impulse-only mode (deform detection off)
         else
-            showInjuriesFor(nil, nil, injSpeed)
+            showInjuriesFor(nil, nil, injSpeed, 0)
         end
     end
     -- clear the window so the same crash can't re-trigger the instant the cooldown ends
@@ -1446,8 +1560,8 @@ local function sendDamageHit(boost, coverMax, cap)
     pcall(function()
         be:executeJS("window.__DeathScreen && window.__DeathScreen.damage(" ..
             string.format("%.3f", boost) .. "," .. string.format("%.3f", coverMax) .. "," ..
-            jsStr(hexOf(dmgVigColorArr)) .. "," .. math.floor(dmgVigFadePtr[0] * 1000 + 0.5) .. "," ..
-            string.format("%.3f", cap) .. "," .. string.format("%.3f", dmgVigSoftPtr[0]) .. ");")
+            jsStr(hexOf(DVIG.color)) .. "," .. math.floor(DVIG.fade[0] * 1000 + 0.5) .. "," ..
+            string.format("%.3f", cap) .. "," .. string.format("%.3f", DVIG.soft[0]) .. ");")
     end)
 end
 
@@ -1457,7 +1571,7 @@ local function dmgClear()
 end
 
 local function updateDamageVignette(dt)
-    if not (enabledPtr[0] and dmgVigPtr[0]) then   -- global master + own toggle
+    if not (enabledPtr[0] and DVIG.on[0]) then   -- global master + own toggle
         if dmgVigWasOn then dmgClear(); dmgVigWasOn = false end
         dmgAccum = 0
         return
@@ -1470,9 +1584,9 @@ local function updateDamageVignette(dt)
         -- only feed a hit when fresh damage arrived (and not under a blackout).
         -- boost is based on THIS batch of damage (dmgAccum) so repeated hits add up.
         if dmgAccum > 0 and not isShowing then
-            local cap = dmgVigMaxPtr[0]
-            local hitP = math.min(1, dmgAccum / math.max(1, dmgVigFullPtr[0]))
-            sendDamageHit(hitP * cap, dmgVigCoverPtr[0], cap)
+            local cap = DVIG.max[0]
+            local hitP = math.min(1, dmgAccum / math.max(1, DVIG.full[0]))
+            sendDamageHit(hitP * cap, DVIG.cover[0], cap)
         end
         dmgAccum = 0
     end
@@ -1790,26 +1904,26 @@ local function drawEffects()
 
     --------------------------------------------------------------------------
     if section("Damage vignette (any crash)", true) then
-        if checkbox("Enable damage vignette", dmgVigPtr,
+        if checkbox("Enable damage vignette", DVIG.on,
             "FPS-style: ANY crash (even a light one, no death screen needed) flashes a colored vignette at the screen edges that fades away. The bigger the hit, the stronger it flashes.") then dirty = true end
-        if dmgVigPtr[0] then
-            if im.ColorEdit3("Color", dmgVigColorArr) then dirty = true end
+        if DVIG.on[0] then
+            if im.ColorEdit3("Color", DVIG.color) then dirty = true end
             im.SameLine()
             if im.Button("Reset##dmgcol") then
-                dmgVigColorArr[0] = im.Float(DEFAULT_DMGCOLOR[1])
-                dmgVigColorArr[1] = im.Float(DEFAULT_DMGCOLOR[2])
-                dmgVigColorArr[2] = im.Float(DEFAULT_DMGCOLOR[3])
+                DVIG.color[0] = im.Float(DEFAULT_DMGCOLOR[1])
+                DVIG.color[1] = im.Float(DEFAULT_DMGCOLOR[2])
+                DVIG.color[2] = im.Float(DEFAULT_DMGCOLOR[3])
                 dirty = true
             end
-            if slider("dvmax", "Max strength", dmgVigMaxPtr, 0.1, 1.0, "%.2f",
+            if slider("dvmax", "Max strength", DVIG.max, 0.1, 1.0, "%.2f",
                 "How opaque the flash can get on the hardest hit. Lower = subtler. Set to 1.0 (with Coverage 1.0) so the biggest crashes reach fully solid.") then dirty = true end
-            if slider("dvcover", "Coverage", dmgVigCoverPtr, 0.0, 1.0, "%.2f",
+            if slider("dvcover", "Coverage", DVIG.cover, 0.0, 1.0, "%.2f",
                 "How far it reaches in from the edges on the hardest hit. 0 = a thin rim, 1 = closes right in to the centre. Smaller hits reach in proportionally less. For a 'knocked out' look, set Coverage AND Max strength to 1.0 with a black color -- hard crashes then close all the way to solid black, while light ones stay a partial rim.") then dirty = true end
-            if slider("dvsoft", "Softness", dmgVigSoftPtr, 0.0, 1.0, "%.2f",
+            if slider("dvsoft", "Softness", DVIG.soft, 0.0, 1.0, "%.2f",
                 "How gradual the edge fade is. Low = a tight, defined ring. High = the red keeps deepening all the way to the corners, reaching full only at the very edge, so there's NO visible line where it starts fading -- a smooth, edgeless tint. Push toward 1.0 if you can still see where the fade begins.") then dirty = true end
-            if slider("dvfull", "Full at damage", dmgVigFullPtr, 1000.0, 300000.0, "%.0f",
+            if slider("dvfull", "Full at damage", DVIG.full, 1000.0, 300000.0, "%.0f",
                 "Crash force that flashes it to full strength. Lower = even small hits flash strongly. (Uses the same 'crash force' as the readout above.)") then dirty = true end
-            if slider("dvfade", "Fade time", dmgVigFadePtr, 0.2, 5.0, "%.1f s",
+            if slider("dvfade", "Fade time", DVIG.fade, 0.2, 5.0, "%.1f s",
                 "How long the flash takes to fade away after a hit.") then dirty = true end
         end
     end
@@ -1839,6 +1953,19 @@ local function drawInjury()
                 INJ.color[0] = im.Float(DEFAULT_INJCOLOR[1]); INJ.color[1] = im.Float(DEFAULT_INJCOLOR[2]); INJ.color[2] = im.Float(DEFAULT_INJCOLOR[3])
                 dirty = true
             end
+            im.Text("Position:"); im.SameLine()
+            if im.RadioButton2("Auto##injpos", INJ.pos, 0) then dirty = true end
+            im.SameLine(); if im.RadioButton2("Top##injpos", INJ.pos, 1) then dirty = true end
+            im.SameLine(); if im.RadioButton2("Center##injpos", INJ.pos, 2) then dirty = true end
+            im.SameLine(); if im.RadioButton2("Bottom##injpos", INJ.pos, 3) then dirty = true end
+            im.SameLine(); helpMarker("Where the report sits on screen. Auto = wherever the message isn't (the opposite end from your message position), or centred when there's no message. If a position would land on the message, the report slides just clear of it - the message itself never moves.")
+            -- Picking the message's own spot is allowed; it just gets nudged clear when shown.
+            -- Flag it here so "Center" not being exactly centred isn't a surprise.
+            if showTextPtr[0] and INJ.pos[0] >= 1 and (INJ.pos[0] - 1) == textPosPtr[0] then
+                im.TextColored(im.ImVec4(0.95, 0.75, 0.35, 1.0), "Shares the message's spot - will shift clear.")
+            end
+            if slider("injdelay", "Show after", INJ.delay, 0.3, 6.0, "%.1f s",
+                "How long after the crash the report fades in. It's automatically capped so the report always has time to be READ before the screen clears - push this past your Blackout length and it just settles near the end instead of flashing by. Want a genuinely longer delay? Raise the Blackout length, that's what this is capped against. (With deformation detection on, it also can't beat the ~0.5s the game needs to read the crush first.)") then dirty = true end
             if slider("injtough", "Survivability", INJ.tough, 0.5, 2.0, "%.2fx",
                 "How well you shrug off crashes. Higher = survive harder hits (e.g. with a roll cage), lower = fragile. 1.0 = default. Frontal crashes are always more survivable than side/rollover.") then dirty = true end
             if checkbox("Allow fatal injuries", INJ.showFatal,
@@ -1946,6 +2073,11 @@ local function drawPresets()
             savePreset(ffi.string(presetNameBuf):match("^%s*(.-)%s*$"))
         end
         helpMarker("Type a name and hit Save to store ALL your current settings as a preset. Load one below to switch to it instantly. Great for a 'cinematic' set vs a 'subtle' set, etc.")
+        if im.Button("Open presets folder") then
+            ensurePresetDir()
+            pcall(function() if Engine and Engine.Platform then Engine.Platform.exploreFolder(PRESETS_DIR) end end)
+        end
+        helpMarker("Each preset is its own file in here. To SHARE one, send someone the file; to add someone else's, drop it in this folder - it shows up in the list live, no restart needed.")
         local names = {}
         for k in pairs(presets) do names[#names + 1] = k end
         table.sort(names)
@@ -1995,7 +2127,7 @@ local function drawSettingsWindow()
             if checkbox("Enable blackout", blackoutPtr,
                 "Black out the screen after a hard crash (the core death-screen effect). Turn this OFF to keep only the other effects -- e.g. crash blur and the damage vignette -- with no blackout. (The global 'Enabled' switch above still has to be on.)") then dirty = true end
             if slider("dur",  "Blackout length", durationPtr, 0.5, 15.0, "%.1f s",
-                "How long the screen stays fully black.") then dirty = true end
+                "How long the screen stays fully black. This also sets how long the message and the injury report stay on screen - including when 'Enable blackout' is OFF, where the screen isn't darkened but this still times the message/report.") then dirty = true end
             if slider("fin",  "Fade to black", fadeInPtr, 0.0, 3.0, "%.2f s",
                 "How fast the screen goes black on impact. 0 = instant.") then dirty = true end
             if slider("fout", "Fade back in", fadeOutPtr, 0.0, 5.0, "%.2f s",
@@ -2254,6 +2386,10 @@ local function onUpdate(dtReal)
     updateBlur(dtReal)
     -- keep a rolling pre-crash node snapshot while driving fast enough to crash (deform direction);
     -- free when the injury report is off, when parked/slow, or while a death screen is up
+    if windowOpen[0] then   -- live-refresh the preset list from the Presets/ folder while the window is open
+        presetPollT = presetPollT - (dtReal or 0)
+        if presetPollT <= 0 then presetPollT = 1.0; refreshPresets() end
+    end
     if INJ.on[0] and INJ.deform[0] and not isShowing and DEF.speed > 8 then   -- low gate: slow door-hit lineups still get a snapshot
         DEF.snapT = DEF.snapT - (dtReal or 0)
         if DEF.snapT <= 0 then DEF.snapT = 0.5; snapshotDeform() end
@@ -2342,6 +2478,7 @@ end
 
 local function onExtensionLoaded()
     loadSettings()
+    refreshPresets()   -- load presets from the Presets/ folder (loadSettings migrated any legacy ones)
     log('I', "DeathScreen", "Death Screen loaded. Bind keys under Options > Controls > Bindings > Death Screen.")
 end
 
