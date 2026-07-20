@@ -54,6 +54,8 @@ Save your whole current setup under a name, then load or switch between presets 
 | --- | --- | --- |
 | Enabled | on | **Global master.** Off = nothing happens on a crash at all (no blackout, blur, or vignette). |
 | Hide window during death screen | on | Auto-closes the settings window while the death screen plays, then reopens it after. |
+| Hide UI apps during death screen | on | Hides the game's UI apps (minimap, gauges...) while the death screen plays, then brings them back. The minimap otherwise draws on top of the blackout. Turn it off if you already play with your UI apps hidden, or they'll be switched back on after a crash. |
+| Show even with the game UI hidden | off | If you play with the whole game UI off (Alt+U), the death screen can't draw - it lives inside that UI layer. This switches the layer back on just for the death screen and off again right after, so you get the blackout without getting your HUD back. Your Alt+U state is left as you had it. |
 
 ### Blackout
 

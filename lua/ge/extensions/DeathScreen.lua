@@ -170,6 +170,18 @@ local FONTS = {
 
 local windowOpen   = im.BoolPtr(true)     -- the settings window (open on first load so it's found)
 local hideUIPtr    = im.BoolPtr(true)     -- hide this window while the death screen is showing
+-- The game's own UI apps (minimap, gauges...). The minimap in particular draws OVER our
+-- blackout, so it stays visible mid-death-screen unless we hide it. `hidden` is the
+-- did-WE-hide-it latch, so we only ever put them back if we were the ones who took them
+-- away. Table, not a bare local: we're near LuaJIT's 200-local cap on this chunk.
+-- forceCef: Alt+U (ui_visibility.toggle) turns the whole CEF layer off, and our overlay is a
+-- DOM node INSIDE it -- so with the UI hidden nothing we draw appears at all. Opt-in: bring
+-- CEF back just for the death screen. We touch setCef ONLY, never set()/setImgui, so their
+-- hidden imgui (our own settings window included) stays hidden the way they left it.
+-- restoreT defers putting the game's UI back until a fade-out has finished, so it can't pop
+-- in mid-fade. Fields on the table, not bare locals: we're at LuaJIT's 200-local ceiling.
+local UIAPPS = { hide = im.BoolPtr(true), hidden = false,
+                 forceCef = im.BoolPtr(false), cefForced = false, restoreT = 0 }
 
 -- rolling damage window
 -- Injury report (Tier 1: severity-based flavour). INJURIES[tone][tier] = a pool of lines;
@@ -326,6 +338,8 @@ local function saveSettings2(t)
     t.textFont      = textFontPtr[0]
     t.windowOpen    = windowOpen[0]
     t.hideUI        = hideUIPtr[0]
+    t.hideUiApps    = UIAPPS.hide[0]
+    t.forceCefUi    = UIAPPS.forceCef[0]
     t.noticeSeen    = noticeSeen
 end
 
@@ -458,6 +472,8 @@ local function loadSettings2(s)
     if s.textFont   ~= nil then textFontPtr[0]   = math.max(0, math.min(#FONTS - 1, math.floor(tonumber(s.textFont) or 0))) end
     if s.windowOpen ~= nil then windowOpen[0]  = (s.windowOpen == true) end
     if s.hideUI     ~= nil then hideUIPtr[0]   = (s.hideUI == true) end
+    if s.hideUiApps ~= nil then UIAPPS.hide[0] = (s.hideUiApps == true) end
+    if s.forceCefUi ~= nil then UIAPPS.forceCef[0] = (s.forceCefUi == true) end
     if s.noticeSeen ~= nil then noticeSeen     = (s.noticeSeen == true) end
     -- one-time migration: presets used to live in settings.json; move each to its own file
     -- in Presets/, then re-save settings.json (buildSettings no longer includes them, so the
@@ -1486,6 +1502,20 @@ local function triggerDeathScreen(force, crashForce, held, injSpeed)
     opts = opts .. buildMessageOpts()   -- message text/style opts (own fn: keeps triggerDeathScreen under the 60-upvalue cap)
     opts = opts .. "}"
 
+    -- Player has the game UI hidden (Alt+U)? Our overlay lives inside the CEF layer, so it
+    -- would draw nothing. Bring CEF back for the duration -- BEFORE the show below, so the
+    -- layer is live by the time the overlay fades in. Latched, and any pending restore from
+    -- a previous screen is cancelled so it can't fire mid-blackout and black us out again.
+    UIAPPS.restoreT = 0
+    if UIAPPS.forceCef[0] and not UIAPPS.cefForced then
+        pcall(function()
+            if ui_visibility and ui_visibility.getCef and not ui_visibility.getCef() then
+                UIAPPS.cefForced = true
+                ui_visibility.setCef(true)
+            end
+        end)
+    end
+
     pcall(function()
         be:executeJS("window.__DeathScreen && window.__DeathScreen.show(" .. opts .. ");")
     end)
@@ -1493,6 +1523,12 @@ local function triggerDeathScreen(force, crashForce, held, injSpeed)
     isShowing   = true
     heldActive  = held or false
     activeTimer = (fadeInMs + holdMs + fadeOutMs) / 1000 + 0.25   -- (ignored while heldActive)
+    -- Hide the game's UI apps for the duration (the minimap otherwise sits on top of the
+    -- black). Latched so the restore in restoreHiddenUI() only fires if we actually hid them.
+    if UIAPPS.hide[0] and not UIAPPS.hidden then
+        UIAPPS.hidden = true
+        pcall(function() if guihooks then guihooks.trigger('ShowApps', false) end end)
+    end
     if hideUIPtr[0] and windowOpen[0] then   -- get the settings window out of the shot
         windowOpen[0] = false
         uiHiddenByTrigger = true
@@ -2113,6 +2149,10 @@ local function drawSettingsWindow()
             "Global master switch for the whole mod. When OFF, nothing happens on a crash at all -- no blackout, no crash blur, no damage vignette. Turn individual effects on/off in their own sections.") then dirty = true end
         if checkbox("Hide window during death screen", hideUIPtr,
             "Auto-hides this settings window while a death screen is playing (so it's not in your shot), then reopens it when the blackout ends.") then dirty = true end
+        if checkbox("Hide UI apps during death screen", UIAPPS.hide,
+            "Hides the game's UI apps (minimap, gauges...) while the death screen is playing, then brings them back. The minimap in particular draws on top of the blackout, so it stays visible without this. Turn it off if you already play with your UI apps hidden - otherwise they'll be switched back on after a crash.") then dirty = true end
+        if checkbox("Show even with the game UI hidden", UIAPPS.forceCef,
+            "If you play with the whole game UI turned off (Alt+U), the death screen can't draw at all - it lives inside that UI layer. With this on, the UI layer is switched back on just for the death screen and off again straight after, so you get the blackout without getting your HUD back. Your Alt+U state is left exactly as you had it.") then dirty = true end
         im.TextDisabled("Tip: right-click any slider to type an exact value.")
         if not settingsKeybindBound() then
             im.TextColored(im.ImVec4(1.00, 0.82, 0.40, 1.00),
@@ -2267,10 +2307,35 @@ local function hideOverlayJS()
 end
 
 -- reopen the settings window if WE hid it for the blackout
-local function restoreHiddenUI()
+-- Undo everything the death screen hid. Called from ALL THREE teardown paths
+-- (cancelDeathScreen, releasePassout, and the normal blackout end), which is exactly why
+-- the UI-app restore lives here rather than at each call site: a missed path would leave
+-- the player's minimap/gauges gone for good, with nothing in our UI to explain it.
+-- Note the app restore sits OUTSIDE the uiHiddenByTrigger guard -- that guard is only
+-- about our own settings window, and the two are hidden independently.
+-- `delay` (seconds) defers putting the GAME's UI back, for callers that end the screen while
+-- the black is still fading out (the passout release): restoring instantly would snap the
+-- apps back and, with forced CEF, kill the overlay mid-fade instead of letting it ease off.
+-- No delay = restore now, which is what the reset/unload paths and the natural end want.
+local function restoreHiddenUI(delay)
     if uiHiddenByTrigger then
         windowOpen[0] = true
         uiHiddenByTrigger = false
+    end
+    if delay and delay > 0 and (UIAPPS.hidden or UIAPPS.cefForced) then
+        UIAPPS.restoreT = delay
+        return
+    end
+    UIAPPS.restoreT = 0
+    if UIAPPS.hidden then
+        UIAPPS.hidden = false
+        pcall(function() if guihooks then guihooks.trigger('ShowApps', true) end end)
+    end
+    if UIAPPS.cefForced then
+        UIAPPS.cefForced = false
+        -- setCef only (never set()): puts the web UI back exactly as Alt+U had it and
+        -- leaves their imgui alone, since we never touched it.
+        pcall(function() if ui_visibility and ui_visibility.setCef then ui_visibility.setCef(false) end end)
     end
 end
 
@@ -2343,7 +2408,9 @@ local function releasePassout()
         local fade = soundBackFadePtr[0]
         if fade > 0 then soundBackFadeDur = fade; soundBackFadeTimer = fade else unmuteGame() end
     end
-    restoreHiddenUI()
+    -- the black is still easing out over PASSOUT.fadeOut here, so hold the game's UI back
+    -- until it's actually gone (+ a beat) instead of popping it in over the fade
+    restoreHiddenUI(PASSOUT.fadeOut[0] + 0.15)
     cooldownTimer = RETRIGGER_COOLDOWN
 end
 
@@ -2412,6 +2479,12 @@ local function onUpdate(dtReal)
                 unmuteGame()              -- instant: hear the world again at once
             end
         end
+    end
+    -- deferred restore of the game's UI (apps / forced CEF), armed by restoreHiddenUI(delay)
+    -- when a screen ended while its black was still fading out
+    if UIAPPS.restoreT > 0 then
+        UIAPPS.restoreT = UIAPPS.restoreT - (dtReal or 0)
+        if UIAPPS.restoreT <= 0 then restoreHiddenUI() end   -- no arg = restore now
     end
     -- swell the game audio back up from silence to the player's volume
     if soundBackFadeTimer > 0 then
